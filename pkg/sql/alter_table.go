@@ -308,7 +308,9 @@ func (n *alterTableNode) startExec(params runParams) error {
 							"index %q being dropped, try again later", d.Name)
 					}
 				}
-				if err := n.tableDesc.AddIndexMutation(params.ctx, &idx, descpb.DescriptorMutation_ADD, params.p.ExecCfg().Settings); err != nil {
+				if err := n.tableDesc.AddIndexMutationMaybeWithTempIndex(
+					params.ctx, &idx, descpb.DescriptorMutation_ADD, params.p.ExecCfg().Settings,
+				); err != nil {
 					return err
 				}
 
@@ -998,17 +1000,9 @@ func applyColumnMutation(
 			}
 		}
 
-		info, err := tableDesc.GetConstraintInfo()
-		if err != nil {
+		if err := addNotNullConstraintMutationForCol(tableDesc, col); err != nil {
 			return err
 		}
-		inuseNames := make(map[string]struct{}, len(info))
-		for k := range info {
-			inuseNames[k] = struct{}{}
-		}
-		check := tabledesc.MakeNotNullCheckConstraint(col.GetName(), col.GetID(), tableDesc.GetNextConstraintID(), inuseNames, descpb.ConstraintValidity_Validating)
-		tableDesc.AddNotNullMutation(check, descpb.DescriptorMutation_ADD)
-		tableDesc.NextConstraintID++
 
 	case *tree.AlterTableDropNotNull:
 		if col.IsNullable() {
@@ -1062,6 +1056,21 @@ func applyColumnMutation(
 		}
 		col.ColumnDesc().ComputeExpr = nil
 	}
+	return nil
+}
+
+func addNotNullConstraintMutationForCol(tableDesc *tabledesc.Mutable, col catalog.Column) error {
+	info, err := tableDesc.GetConstraintInfo()
+	if err != nil {
+		return err
+	}
+	inuseNames := make(map[string]struct{}, len(info))
+	for k := range info {
+		inuseNames[k] = struct{}{}
+	}
+	check := tabledesc.MakeNotNullCheckConstraint(col.GetName(), col.GetID(), tableDesc.GetNextConstraintID(), inuseNames, descpb.ConstraintValidity_Validating)
+	tableDesc.AddNotNullMutation(check, descpb.DescriptorMutation_ADD)
+	tableDesc.NextConstraintID++
 	return nil
 }
 
@@ -1160,19 +1169,19 @@ func updateSequenceDependencies(
 		seqDescsToUpdate = truncated
 	}
 	for _, colExpr := range []struct {
-		name   string
-		exists func() bool
-		get    func() string
+		colExprKind tabledesc.ColExprKind
+		exists      func() bool
+		get         func() string
 	}{
 		{
-			name:   "DEFAULT",
-			exists: colDesc.HasDefault,
-			get:    colDesc.GetDefaultExpr,
+			colExprKind: tabledesc.DefaultExpr,
+			exists:      colDesc.HasDefault,
+			get:         colDesc.GetDefaultExpr,
 		},
 		{
-			name:   "ON UPDATE",
-			exists: colDesc.HasOnUpdate,
-			get:    colDesc.GetOnUpdateExpr,
+			colExprKind: tabledesc.OnUpdateExpr,
+			exists:      colDesc.HasOnUpdate,
+			get:         colDesc.GetOnUpdateExpr,
 		},
 	} {
 		if !colExpr.exists() {
@@ -1187,7 +1196,7 @@ func updateSequenceDependencies(
 			params,
 			untypedExpr,
 			colDesc,
-			"DEFAULT",
+			string(colExpr.colExprKind),
 		)
 		if err != nil {
 			return err
@@ -1201,6 +1210,7 @@ func updateSequenceDependencies(
 			colDesc.ColumnDesc(),
 			typedExpr,
 			nil, /* backrefs */
+			colExpr.colExprKind,
 		)
 		if err != nil {
 			return err

@@ -21,6 +21,15 @@ import (
 
 type mutationOp struct{ baseOp }
 
+// EventBase basic fields needed for anything event log related
+type EventBase struct {
+	TargetMetadata scpb.TargetMetadata
+	Authorization  scpb.Authorization
+	Statement      string
+	StatementTag   string
+	Element        scpb.ElementProto
+}
+
 // Make sure baseOp is used for linter.
 var _ = mutationOp{baseOp: baseOp{}}
 
@@ -33,9 +42,17 @@ type NotImplemented struct {
 	ElementType string
 }
 
-// MakeAddedIndexDeleteOnly adds a non-existent primary index to the
-// table.
-type MakeAddedIndexDeleteOnly struct {
+// MakeAddedTempIndexDeleteOnly adds a non-existent index to the
+// table in the DELETE_ONLY state.
+type MakeAddedTempIndexDeleteOnly struct {
+	mutationOp
+	Index            scpb.Index
+	IsSecondaryIndex bool
+}
+
+// MakeAddedIndexBackfilling adds a non-existent index to the
+// table in the BACKFILLING state.
+type MakeAddedIndexBackfilling struct {
 	mutationOp
 	Index              scpb.Index
 	IsSecondaryIndex   bool
@@ -59,6 +76,14 @@ type MakeAddedIndexDeleteAndWriteOnly struct {
 	IndexID descpb.IndexID
 }
 
+// MakeBackfillingIndexDeleteOnly transitions an index addition mutation from
+// BACKFILLING to DELETE_ONLY.
+type MakeBackfillingIndexDeleteOnly struct {
+	mutationOp
+	TableID descpb.ID
+	IndexID descpb.IndexID
+}
+
 // MakeAddedSecondaryIndexPublic moves a new primary index from its mutation to
 // public.
 type MakeAddedSecondaryIndexPublic struct {
@@ -71,6 +96,7 @@ type MakeAddedSecondaryIndexPublic struct {
 // public.
 type MakeAddedPrimaryIndexPublic struct {
 	mutationOp
+	EventBase
 	TableID descpb.ID
 	IndexID descpb.IndexID
 }
@@ -160,6 +186,7 @@ type RemoveDroppedIndexPartialPredicate struct {
 // table.
 type MakeIndexAbsent struct {
 	mutationOp
+	EventBase
 	TableID descpb.ID
 	IndexID descpb.IndexID
 }
@@ -179,6 +206,7 @@ type SetAddedColumnType struct {
 // MakeColumnPublic moves a new column from its mutation to public.
 type MakeColumnPublic struct {
 	mutationOp
+	EventBase
 	TableID  descpb.ID
 	ColumnID descpb.ColumnID
 }
@@ -211,6 +239,7 @@ type RemoveDroppedColumnType struct {
 // table.
 type MakeColumnAbsent struct {
 	mutationOp
+	EventBase
 	TableID  descpb.ID
 	ColumnID descpb.ColumnID
 }
@@ -269,12 +298,9 @@ type AddIndexPartitionInfo struct {
 // LogEvent logs an event for a given descriptor.
 type LogEvent struct {
 	mutationOp
-	TargetMetadata scpb.TargetMetadata
-	Authorization  scpb.Authorization
-	Statement      string
-	StatementTag   string
-	Element        scpb.ElementProto
-	TargetStatus   scpb.Status
+	EventBase
+	Element      scpb.ElementProto
+	TargetStatus scpb.Status
 }
 
 // AddColumnFamily adds a new column family to the table.
@@ -516,4 +542,10 @@ type RemoveDatabaseRoleSettings struct {
 type DeleteSchedule struct {
 	mutationOp
 	ScheduleID int64
+}
+
+// RefreshStats is used to queue a table for stats refresh.
+type RefreshStats struct {
+	mutationOp
+	TableID descpb.ID
 }

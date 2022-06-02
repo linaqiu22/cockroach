@@ -34,8 +34,9 @@ func TestRunAllocatorSimulator(t *testing.T) {
 	start := time.Date(2022, 03, 21, 11, 0, 0, 0, time.UTC)
 	end := start.Add(25 * time.Second)
 	interval := 10 * time.Second
+	exchange := asim.NewFixedDelayExhange(start, interval, interval)
 	s := asim.LoadConfig(asim.SingleRegionConfig)
-	sim := asim.NewSimulator(start, end, interval, rwg, s)
+	sim := asim.NewSimulator(start, end, interval, rwg, s, exchange)
 	sim.RunSim(ctx)
 }
 
@@ -56,6 +57,10 @@ func TestRangeMap(t *testing.T) {
 	require.Equal(t, r1.MinKey, m.GetRange("c").MinKey)
 	require.Equal(t, r2.MinKey, m.GetRange("g").MinKey)
 	require.Equal(t, r3.MinKey, m.GetRange("z").MinKey)
+
+	require.Panics(t, func() { m.AddRange("b") }, "Adding a range with the same minKey twice should panic")
+	require.Panics(t, func() { m.AddRange("f") }, "Adding a range with the same minKey twice should panic")
+	require.Panics(t, func() { m.AddRange("x") }, "Adding a range with the same minKey twice should panic")
 }
 
 func TestAddReplica(t *testing.T) {
@@ -116,16 +121,16 @@ func TestWorkloadApply(t *testing.T) {
 
 	// Assert that the leaseholder replica load correctly matches the number of
 	// requests made.
-	require.Equal(t, int64(100), r1.Leaseholder.ReplicaLoad.ReadKeys)
-	require.Equal(t, int64(1000), r2.Leaseholder.ReplicaLoad.ReadKeys)
-	require.Equal(t, int64(10000), r3.Leaseholder.ReplicaLoad.ReadKeys)
+	require.Equal(t, float64(100), r1.Leaseholder.ReplicaLoad.Load().QueriesPerSecond)
+	require.Equal(t, float64(1000), r2.Leaseholder.ReplicaLoad.Load().QueriesPerSecond)
+	require.Equal(t, float64(10000), r3.Leaseholder.ReplicaLoad.Load().QueriesPerSecond)
 
-	expectedLoad := asim.StoreLoad{ReadKeys: 100, LeaseCount: 1, RangeCount: 1}
+	expectedLoad := roachpb.StoreCapacity{QueriesPerSecond: 100, LeaseCount: 1, RangeCount: 1}
 
 	// Assert that the store load is also updated upon request GetStoreLoad.
-	require.Equal(t, expectedLoad, s.Nodes[n1].Stores[0].GetStoreLoad())
-	expectedLoad.ReadKeys *= 10
-	require.Equal(t, expectedLoad, s.Nodes[n2].Stores[0].GetStoreLoad())
-	expectedLoad.ReadKeys *= 10
-	require.Equal(t, expectedLoad, s.Nodes[n3].Stores[0].GetStoreLoad())
+	require.Equal(t, expectedLoad, s.Nodes[n1].Stores[0].Capacity())
+	expectedLoad.QueriesPerSecond *= 10
+	require.Equal(t, expectedLoad, s.Nodes[n2].Stores[0].Capacity())
+	expectedLoad.QueriesPerSecond *= 10
+	require.Equal(t, expectedLoad, s.Nodes[n3].Stores[0].Capacity())
 }

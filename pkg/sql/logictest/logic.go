@@ -565,6 +565,9 @@ type testClusterConfig struct {
 	// backupRestoreProbability will periodically backup the cluster and restore
 	// it's state to a new cluster at random points during a logic test.
 	backupRestoreProbability float64
+	// disableDeclarativeSchemaChanger will disable the declarative schema changer
+	// for logictest.
+	disableDeclarativeSchemaChanger bool
 }
 
 const queryRewritePlaceholderPrefix = "__async_query_rewrite_placeholder"
@@ -734,6 +737,12 @@ var logicTestConfigs = []testClusterConfig{
 		overrideDistSQLMode: "off",
 	},
 	{
+		name:                            "local-legacy-schema-changer",
+		numNodes:                        1,
+		overrideDistSQLMode:             "off",
+		disableDeclarativeSchemaChanger: true,
+	},
+	{
 		name:                "local-vec-off",
 		numNodes:            1,
 		overrideDistSQLMode: "off",
@@ -820,10 +829,11 @@ var logicTestConfigs = []testClusterConfig{
 		// logictest command.
 		// To run a logic test with this config as a directive, run:
 		// make test PKG=./pkg/ccl/logictestccl TESTS=TestTenantLogic//<test_name>
-		name:        threeNodeTenantConfigName,
-		numNodes:    3,
-		useTenant:   true,
-		isCCLConfig: true,
+		name:                threeNodeTenantConfigName,
+		numNodes:            3,
+		useTenant:           true,
+		isCCLConfig:         true,
+		overrideDistSQLMode: "on",
 	},
 	// Regions and zones below are named deliberately, and contain "-"'s to be reflective
 	// of the naming convention in public clouds.  "-"'s are handled differently in SQL
@@ -1593,10 +1603,10 @@ func (t *logicTest) setUser(user string, nodeIdxOverride int) func() {
 	db := t.openDB(pgURL)
 
 	// The default value for extra_float_digits assumed by tests is
-	// 0. However, lib/pq by default configures this to 2 during
-	// connection initialization, so we need to set it back to 0 before
+	// 1. However, lib/pq by default configures this to 2 during
+	// connection initialization, so we need to set it back to 1 before
 	// we run anything.
-	if _, err := db.Exec("SET extra_float_digits = 0"); err != nil {
+	if _, err := db.Exec("SET extra_float_digits = 1"); err != nil {
 		t.Fatal(err)
 	}
 	// The default setting for index_recommendations_enabled is true. We do not
@@ -1903,6 +1913,15 @@ func (t *logicTest) newCluster(
 			if _, err := conn.Exec(
 				"SET CLUSTER SETTING sql.defaults.vectorize = $1::string", cfg.overrideVectorize,
 			); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		// We support disabling the declarative schema changer, so that no regressions
+		// occur in the legacy schema changer.
+		if cfg.disableDeclarativeSchemaChanger {
+			if _, err := conn.Exec(
+				"SET CLUSTER SETTING sql.defaults.use_declarative_schema_changer='off'"); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -3403,7 +3422,7 @@ func (t *logicTest) verifyError(
 		} else {
 			newErr := errors.Errorf("%s: %s\nexpected error code %q, but found success",
 				pos, sql, expectErrCode)
-			return (err != nil), newErr
+			return err != nil, newErr
 		}
 	}
 	return true, nil

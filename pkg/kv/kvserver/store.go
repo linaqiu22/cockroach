@@ -238,7 +238,7 @@ func TestStoreConfig(clock *hlc.Clock) StoreConfig {
 
 func testStoreConfig(clock *hlc.Clock, version roachpb.Version) StoreConfig {
 	if clock == nil {
-		clock = hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+		clock = hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
 	}
 	st := cluster.MakeTestingClusterSettingsWithVersions(version, version, true)
 	tracer := tracing.NewTracerWithOpt(context.TODO(), tracing.WithClusterSettings(&st.SV))
@@ -2954,12 +2954,16 @@ func (s *Store) Capacity(ctx context.Context, useCached bool) (roachpb.StoreCapa
 	var leaseCount int32
 	var rangeCount int32
 	var logicalBytes int64
+	var l0SublevelsMax int64
 	var totalQueriesPerSecond float64
 	var totalWritesPerSecond float64
 	replicaCount := s.metrics.ReplicaCount.Value()
 	bytesPerReplica := make([]float64, 0, replicaCount)
 	writesPerReplica := make([]float64, 0, replicaCount)
 	rankingsAccumulator := s.replRankings.newAccumulator()
+
+	// Query the current L0 sublevels and record the updated maximum to metrics.
+	l0SublevelsMax = int64(syncutil.LoadFloat64(&s.metrics.l0SublevelsWindowedMax))
 	newStoreReplicaVisitor(s).Visit(func(r *Replica) bool {
 		rangeCount++
 		if r.OwnsValidLease(ctx, now) {
@@ -2993,11 +2997,7 @@ func (s *Store) Capacity(ctx context.Context, useCached bool) (roachpb.StoreCapa
 	capacity.LogicalBytes = logicalBytes
 	capacity.QueriesPerSecond = totalQueriesPerSecond
 	capacity.WritesPerSecond = totalWritesPerSecond
-	// We gossip the maximum number of L0 sub-levels that have been seen in
-	// past 2 windows. The recording length may vary between 5 and 10 minutes
-	// accordingly.
-	windowedL0Sublevels, _ := s.metrics.L0SubLevelsHistogram.Windowed()
-	capacity.L0Sublevels = windowedL0Sublevels.Max()
+	capacity.L0Sublevels = l0SublevelsMax
 	capacity.BytesPerReplica = roachpb.PercentilesFromData(bytesPerReplica)
 	capacity.WritesPerReplica = roachpb.PercentilesFromData(writesPerReplica)
 	s.recordNewPerSecondStats(totalQueriesPerSecond, totalWritesPerSecond)
@@ -3435,12 +3435,8 @@ func (s *Store) ManuallyEnqueue(
 	// Many queues are only meant to be run on leaseholder replicas, so attempt to
 	// take the lease here or bail out early if a different replica has it.
 	if needsLease {
-		hasLease, pErr := repl.getLeaseForGossip(ctx)
-		if pErr != nil {
-			return nil, nil, pErr.GoError()
-		}
-		if !hasLease {
-			return nil, errors.Newf("replica %v does not have the range lease", repl), nil
+		if _, pErr := repl.redirectOnOrAcquireLease(ctx); pErr != nil {
+			return nil, nil, errors.Wrapf(pErr.GoError(), "replica %v does not have the range lease", repl)
 		}
 	}
 

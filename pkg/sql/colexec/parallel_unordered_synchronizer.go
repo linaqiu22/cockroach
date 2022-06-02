@@ -111,8 +111,7 @@ type ParallelUnorderedSynchronizer struct {
 	bufferedMeta []execinfrapb.ProducerMetadata
 }
 
-var _ colexecop.DrainableOperator = &ParallelUnorderedSynchronizer{}
-var _ colexecop.ClosableOperator = &ParallelUnorderedSynchronizer{}
+var _ colexecop.DrainableClosableOperator = &ParallelUnorderedSynchronizer{}
 
 // ChildCount implements the execopnode.OpNode interface.
 func (s *ParallelUnorderedSynchronizer) ChildCount(verbose bool) int {
@@ -487,9 +486,10 @@ func (s *ParallelUnorderedSynchronizer) Close(ctx context.Context) error {
 	// Note that at this point we know that the input goroutines won't be
 	// spawned up (our consumer won't call Next/DrainMeta after calling Close),
 	// so it is safe to close all closers from this goroutine.
-	for _, span := range s.tracingSpans {
+	for i, span := range s.tracingSpans {
 		if span != nil {
 			span.Finish()
+			s.tracingSpans[i] = nil
 		}
 	}
 	var lastErr error

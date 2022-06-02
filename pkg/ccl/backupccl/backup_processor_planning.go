@@ -12,6 +12,8 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backupencryption"
+	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backuppb"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
@@ -65,9 +67,9 @@ func distBackupPlanSpecs(
 	}
 
 	if encryption != nil && encryption.Mode == jobspb.EncryptionMode_KMS {
-		kms, err := cloud.KMSFromURI(encryption.KMSInfo.Uri, &backupKMSEnv{
-			settings: execCfg.Settings,
-			conf:     &execCfg.ExternalIODirConfig,
+		kms, err := cloud.KMSFromURI(ctx, encryption.KMSInfo.Uri, &backupencryption.BackupKMSEnv{
+			Settings: execCfg.Settings,
+			Conf:     &execCfg.ExternalIODirConfig,
 		})
 		if err != nil {
 			return nil, err
@@ -129,7 +131,7 @@ func distBackupPlanSpecs(
 		}
 	}
 
-	backupPlanningTraceEvent := BackupProcessorPlanningTraceEvent{
+	backupPlanningTraceEvent := backuppb.BackupProcessorPlanningTraceEvent{
 		NodeToNumSpans: make(map[int32]int64),
 	}
 	for node, spec := range sqlInstanceIDToSpec {

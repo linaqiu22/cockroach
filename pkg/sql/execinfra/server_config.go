@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/diskmap"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
+	"github.com/cockroachdb/cockroach/pkg/multitenant"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
@@ -37,6 +38,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
+	"github.com/cockroachdb/cockroach/pkg/util/limit"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -112,6 +114,10 @@ type ServerConfig struct {
 	// used during backup.
 	BackupMonitor *mon.BytesMonitor
 
+	// BulkSenderLimiter is the concurrency limiter that is shared across all of
+	// the processes in a given sql server when sending bulk ingest (AddSST) reqs.
+	BulkSenderLimiter limit.ConcurrentRequestLimiter
+
 	// ParentDiskMonitor is normally the root disk monitor. It should only be used
 	// when setting up a server, a child monitor (usually belonging to a sql
 	// execution flow), or in tests. It is used to monitor temporary storage disk
@@ -178,6 +184,10 @@ type ServerConfig struct {
 
 	// CollectionFactory is used to construct descs.Collections.
 	CollectionFactory *descs.CollectionFactory
+
+	// ExternalIORecorder is used to record reads and writes from
+	// external services (such as external storage)
+	ExternalIORecorder multitenant.TenantSideExternalIORecorder
 }
 
 // RuntimeStats is an interface through which the rowexec layer can get

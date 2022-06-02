@@ -327,7 +327,14 @@ DROP TABLE v1
 statement error pgcode 42809 "t" is not a view
 DROP VIEW t
 
+skipif config local-legacy-schema-changer
 statement error cannot drop relation "v1" because view "v7" depends on it
+DROP VIEW v1
+
+# Legacy schema changer orders dependent views differently, but
+# semantically the same error.
+onlyif config local-legacy-schema-changer
+statement error cannot drop relation "v1" because view "v6" depends on it
 DROP VIEW v1
 
 statement error cannot drop relation "v2" because view "test2.public.v1" depends on it
@@ -1238,3 +1245,18 @@ SELECT "reportingID",
  LIMIT 1;
 ----
 1  {"CascadeDroppedViews": ["db2.public.v1nest", "db2.public.v2nest", "db2.public.v3nest"], "EventType": "drop_table", "Statement": "DROP TABLE db2.public.t1nest CASCADE", "TableName": "db2.public.t1nest", "Tag": "DROP TABLE", "User": "root"}
+
+
+statement ok
+CREATE TABLE test_t1(a int);
+
+statement ok
+CREATE MATERIALIZED VIEW li AS (SELECT 1 AS test_t1);
+
+query TT
+SHOW CREATE VIEW li
+----
+li                          CREATE MATERIALIZED VIEW public.li (
+                                                    test_t1,
+                                                    rowid
+                        ) AS (SELECT 1 AS test_t1)

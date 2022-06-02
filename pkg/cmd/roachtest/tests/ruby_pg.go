@@ -23,7 +23,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
@@ -31,7 +30,7 @@ import (
 var rubyPGTestFailureRegex = regexp.MustCompile(`^rspec ./.*# .*`)
 var testFailureFilenameRegexp = regexp.MustCompile("^rspec .*.rb.*([0-9]|]) # ")
 var testSummaryRegexp = regexp.MustCompile("^([0-9]+) examples, [0-9]+ failures")
-var rubyPGVersion = "v1.2.3"
+var rubyPGVersion = "v1.3.5"
 
 // This test runs Ruby PG's full test suite against a single cockroach node.
 func registerRubyPG(r registry.Registry) {
@@ -195,7 +194,7 @@ func registerRubyPG(r registry.Registry) {
 				continue
 			}
 			if len(match) != 1 {
-				log.Fatalf(ctx, "expected one match for test name, found: %d", len(match))
+				t.Fatalf("expected one match for test name, found: %d", len(match))
 			}
 
 			// Take the first test name.
@@ -206,7 +205,7 @@ func registerRubyPG(r registry.Registry) {
 			// ie. test.rb:99 # TEST NAME.
 			strs := testFailureFilenameRegexp.Split(test, -1)
 			if len(strs) != 2 {
-				log.Fatalf(ctx, "expected test output line to be split into two strings")
+				t.Fatalf("expected test output line to be split into two strings")
 			}
 			test = strs[1]
 
@@ -229,7 +228,7 @@ func registerRubyPG(r registry.Registry) {
 		}
 
 		if totalTests == 0 {
-			log.Fatalf(ctx, "failed to find total number of tests run")
+			t.Fatalf("failed to find total number of tests run")
 		}
 		totalPasses := int(totalTests) - (results.failUnexpectedCount + results.failExpectedCount)
 		results.passUnexpectedCount = len(expectedFailures) - results.failExpectedCount

@@ -12,6 +12,7 @@ package kvstreamer
 
 import (
 	"context"
+	gosql "database/sql"
 	"fmt"
 	"math"
 	"sync"
@@ -27,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/errors"
 	"github.com/dustin/go-humanize"
 	"github.com/stretchr/testify/require"
@@ -109,6 +111,15 @@ func TestStreamerLimitations(t *testing.T) {
 	})
 }
 
+// assertTableID verifies that the table specified by 'tableName' has the
+// provided value for TableID.
+func assertTableID(t *testing.T, db *gosql.DB, tableName string, tableID int) {
+	r := db.QueryRow(fmt.Sprintf("SELECT '%s'::regclass::oid", tableName))
+	var actualTableID int
+	require.NoError(t, r.Scan(&actualTableID))
+	require.Equal(t, tableID, actualTableID)
+}
+
 // TestStreamerBudgetErrorInEnqueue verifies the behavior of the Streamer in
 // Enqueue when its limit and/or root pool limit are exceeded. Additional tests
 // around the memory limit errors (when the responses exceed the limit) can be
@@ -125,6 +136,10 @@ func TestStreamerBudgetErrorInEnqueue(t *testing.T) {
 	_, err := db.Exec("CREATE TABLE foo (pk_blob STRING PRIMARY KEY, attribute INT, blob TEXT, INDEX(attribute))")
 	require.NoError(t, err)
 
+	const tableID = 104
+	// Sanity check that the table 'foo' has the expected TableID.
+	assertTableID(t, db, "foo" /* tableName */, tableID)
+
 	// makeGetRequest returns a valid GetRequest that wants to lookup a key with
 	// value 'a' repeated keySize number of times in the primary index of table
 	// foo.
@@ -133,7 +148,7 @@ func TestStreamerBudgetErrorInEnqueue(t *testing.T) {
 		var get roachpb.GetRequest
 		var union roachpb.RequestUnion_Get
 		key := make([]byte, keySize+6)
-		key[0] = 240
+		key[0] = tableID + 136
 		key[1] = 137
 		key[2] = 18
 		for i := 0; i < keySize; i++ {
@@ -378,6 +393,10 @@ func TestStreamerEmptyScans(t *testing.T) {
 	_, err := db.Exec("CREATE TABLE t (pk INT PRIMARY KEY, k INT, blob STRING, INDEX (k), FAMILY (pk, k), FAMILY (blob))")
 	require.NoError(t, err)
 
+	const tableID = 104
+	// Sanity check that the table 't' has the expected TableID.
+	assertTableID(t, db, "t" /* tableName */, tableID)
+
 	// Split the table into 5 ranges and populate the range cache.
 	for pk := 1; pk < 5; pk++ {
 		_, err = db.Exec(fmt.Sprintf("ALTER TABLE t SPLIT AT VALUES(%d)", pk))
@@ -392,7 +411,7 @@ func TestStreamerEmptyScans(t *testing.T) {
 		var union roachpb.RequestUnion_Scan
 		makeKey := func(pk int) []byte {
 			// These numbers essentially make a key like '/t/primary/pk'.
-			return []byte{240, 137, byte(136 + pk)}
+			return []byte{tableID + 136, 137, byte(136 + pk)}
 		}
 		scan.Key = makeKey(start)
 		scan.EndKey = makeKey(end)
@@ -444,5 +463,67 @@ func TestStreamerEmptyScans(t *testing.T) {
 	})
 }
 
-// TODO(yuzefovich): once lookup joins are supported, add a test for InOrder
-// mode where Scan requests span multiple ranges.
+// TestStreamerMultiRangeScan verifies that the Streamer correctly handles scan
+// requests that span multiple ranges.
+func TestStreamerMultiRangeScan(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	ctx := context.Background()
+	defer s.Stopper().Stop(ctx)
+
+	rng, _ := randutil.NewTestRand()
+	numRows := rng.Intn(100) + 2
+
+	// We set up two tables such that we'll use the value from the smaller one
+	// to lookup into a secondary index in the larger table.
+	_, err := db.Exec("CREATE TABLE small (n PRIMARY KEY) AS SELECT 1")
+	require.NoError(t, err)
+	_, err = db.Exec("CREATE TABLE large (k INT PRIMARY KEY, n INT, s STRING, INDEX (n, k) STORING (s))")
+	require.NoError(t, err)
+	_, err = db.Exec(fmt.Sprintf("INSERT INTO large SELECT i, 1, repeat('a', i) FROM generate_series(1, %d) AS i", numRows))
+	require.NoError(t, err)
+
+	// Split the range for the secondary index into multiple.
+	numRanges := 2
+	if numRows > 2 {
+		numRanges = rng.Intn(numRows-2) + 2
+	}
+	kValues := make([]int, numRows)
+	for i := range kValues {
+		kValues[i] = i + 1
+	}
+	rng.Shuffle(numRows, func(i, j int) {
+		kValues[i], kValues[j] = kValues[j], kValues[i]
+	})
+	splitKValues := kValues[:numRanges]
+	for _, kValue := range splitKValues {
+		_, err = db.Exec(fmt.Sprintf("ALTER INDEX large_n_k_idx SPLIT AT VALUES (1, %d)", kValue))
+		require.NoError(t, err)
+	}
+
+	// Populate the range cache.
+	_, err = db.Exec("SELECT * FROM large@large_n_k_idx")
+	require.NoError(t, err)
+
+	// The crux of the test - run a query that performs a lookup join when
+	// ordering needs to be maintained and then confirm that the results of the
+	// parallel lookups are served in the right order.
+	r := db.QueryRow("SELECT array_agg(s) FROM small INNER LOOKUP JOIN large ON small.n = large.n GROUP BY small.n ORDER BY small.n")
+	var result string
+	err = r.Scan(&result)
+	require.NoError(t, err)
+	// The expected result is of the form: {a,aa,aaa,...}.
+	expected := "{"
+	for i := 1; i <= numRows; i++ {
+		if i > 1 {
+			expected += ","
+		}
+		for j := 0; j < i; j++ {
+			expected += "a"
+		}
+	}
+	expected += "}"
+	require.Equal(t, expected, result)
+}

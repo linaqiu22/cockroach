@@ -445,14 +445,18 @@ func getDescriptorsFromTargetListForPrivilegeChange(
 		if len(targets.Schemas) == 0 {
 			return nil, errNoSchema
 		}
-		if targets.AllTablesInSchema {
+		if targets.AllTablesInSchema || targets.AllSequencesInSchema {
 			// Get all the descriptors for the tables in the specified schemas.
-			db, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn, p.CurrentDatabase(), flags)
-			if err != nil {
-				return nil, err
-			}
 			var descs []catalog.Descriptor
 			for _, sc := range targets.Schemas {
+				dbName := p.CurrentDatabase()
+				if sc.ExplicitCatalog {
+					dbName = sc.Catalog()
+				}
+				db, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn, dbName, flags)
+				if err != nil {
+					return nil, err
+				}
 				_, objectIDs, err := resolver.GetObjectNamesAndIDs(
 					ctx, p.txn, p, p.ExecCfg().Codec, db, sc.Schema(), true, /* explicitPrefix */
 				)
@@ -464,8 +468,22 @@ func getDescriptorsFromTargetListForPrivilegeChange(
 					return nil, err
 				}
 				for _, mut := range muts {
-					if mut != nil && mut.DescriptorType() == catalog.Table {
-						descs = append(descs, mut)
+					if targets.AllTablesInSchema {
+						if mut != nil {
+							if mut.DescriptorType() == catalog.Table {
+								descs = append(descs, mut)
+							}
+						}
+					} else if targets.AllSequencesInSchema {
+						if mut.DescriptorType() == catalog.Table {
+							tableDesc, err := catalog.AsTableDescriptor(mut)
+							if err != nil {
+								return nil, err
+							}
+							if tableDesc.IsSequence() {
+								descs = append(descs, mut)
+							}
+						}
 					}
 				}
 			}
@@ -510,11 +528,11 @@ func getDescriptorsFromTargetListForPrivilegeChange(
 		return descs, nil
 	}
 
-	if len(targets.Tables) == 0 {
+	if len(targets.Tables.TablePatterns) == 0 {
 		return nil, errNoTable
 	}
-	descs := make([]catalog.Descriptor, 0, len(targets.Tables))
-	for _, tableTarget := range targets.Tables {
+	descs := make([]catalog.Descriptor, 0, len(targets.Tables.TablePatterns))
+	for _, tableTarget := range targets.Tables.TablePatterns {
 		tableGlob, err := tableTarget.NormalizeTablePattern()
 		if err != nil {
 			return nil, err
@@ -529,7 +547,17 @@ func getDescriptorsFromTargetListForPrivilegeChange(
 		}
 		for _, mut := range muts {
 			if mut != nil && mut.DescriptorType() == catalog.Table {
-				descs = append(descs, mut)
+				if targets.Tables.IsSequence {
+					tableDesc, err := catalog.AsTableDescriptor(mut)
+					if err != nil {
+						return nil, err
+					}
+					if tableDesc.IsSequence() {
+						descs = append(descs, mut)
+					}
+				} else {
+					descs = append(descs, mut)
+				}
 			}
 		}
 	}
@@ -638,7 +666,7 @@ func expandMutableIndexName(
 func expandIndexName(
 	ctx context.Context,
 	txn *kv.Txn,
-	sc resolver.SchemaResolver,
+	p *planner,
 	codec keys.SQLCodec,
 	index *tree.TableIndexName,
 	requireTable bool,
@@ -646,7 +674,7 @@ func expandIndexName(
 	tn = &index.Table
 	if tn.Object() != "" {
 		// The index and its table prefix must exist already. Resolve the table.
-		_, desc, err = resolver.ResolveMutableExistingTableObject(ctx, sc, tn, requireTable, tree.ResolveRequireTableOrViewDesc)
+		_, desc, err = resolver.ResolveMutableExistingTableObject(ctx, p, tn, requireTable, tree.ResolveRequireTableOrViewDesc)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -657,7 +685,7 @@ func expandIndexName(
 		return tn, desc, nil
 	}
 
-	found, resolvedPrefix, tbl, _, err := resolver.ResolveIndex(ctx, sc, index, txn, codec, requireTable, false /*requireActiveIndex*/)
+	found, resolvedPrefix, tbl, _, err := resolver.ResolveIndex(ctx, p, index, txn, codec, requireTable, false /*requireActiveIndex*/)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -674,7 +702,10 @@ func expandIndexName(
 	// Memoize the table name that was found. tn is a reference to the table name
 	// stored in index.Table.
 	*tn = tableName
-	tblMutable := tbl.NewBuilder().BuildExistingMutable().(*tabledesc.Mutable)
+	tblMutable, err := p.Descriptors().GetMutableTableVersionByID(ctx, tbl.GetID(), p.Txn())
+	if err != nil {
+		return nil, nil, err
+	}
 	return &tableName, tblMutable, nil
 }
 

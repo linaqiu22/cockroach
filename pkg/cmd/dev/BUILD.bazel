@@ -1,4 +1,5 @@
 load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
+load("//pkg/testutils/buildutil:buildutil.bzl", "disallowed_imports_test")
 
 go_library(
     name = "dev_lib",
@@ -58,4 +59,19 @@ go_test(
         "@com_github_irfansharif_recorder//:recorder",
         "@com_github_stretchr_testify//require",
     ],
+)
+
+disallowed_imports_test(
+    "dev_lib",
+    allowlist = [
+        "//pkg/build/util",
+        "//pkg/cmd/dev/io/exec",
+        "//pkg/cmd/dev/io/os",
+        "@com_github_alessio_shellescape//:shellescape",
+        "@com_github_google_shlex//:shlex",
+        "@com_github_irfansharif_recorder//:recorder",
+        "@com_github_spf13_cobra//:cobra",
+        "@com_github_spf13_pflag//:pflag",
+    ],
+    disallow_cdeps = True,
 )

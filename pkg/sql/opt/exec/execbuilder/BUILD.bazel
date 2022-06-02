@@ -65,7 +65,7 @@ go_test(
     embed = [":execbuilder"],
     shard_count = 16,
     deps = [
-        "//pkg/security",
+        "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/server",
         "//pkg/sql",
@@ -79,4 +79,10 @@ go_test(
         "//pkg/util/leaktest",
         "//pkg/util/randutil",
     ],
+)
+
+filegroup(
+    name = "testdata",
+    srcs = glob(["testdata/**"]),
+    visibility = ["//pkg/ccl/logictestccl:__subpackages__"],
 )

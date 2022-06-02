@@ -42,6 +42,10 @@ type BuildCtx interface {
 	// Add adds an absent element to the BuilderState, targeting PUBLIC.
 	Add(element scpb.Element)
 
+	// AddTransient adds an absent element to the BuilderState, targeting
+	// TRANSIENT_ABSENT.
+	AddTransient(element scpb.Element)
+
 	// Drop sets the ABSENT target on an existing element in the BuilderState.
 	Drop(element scpb.Element)
 
@@ -129,6 +133,15 @@ type Telemetry interface {
 	// counter.
 	IncrementSchemaChangeDropCounter(counterType string)
 
+	// IncrementSchemaChangeAddColumnTypeCounter increments telemetry counters for
+	// different types added as columns.
+	IncrementSchemaChangeAddColumnTypeCounter(typeName string)
+
+	// IncrementSchemaChangeAddColumnQualificationCounter increments telemetry
+	// counters for different qualifications (default expressions) on a newly
+	// added column.
+	IncrementSchemaChangeAddColumnQualificationCounter(qualification string)
+
 	// IncrementUserDefinedSchemaCounter increments the selected user-defined
 	// schema telemetry counter.
 	IncrementUserDefinedSchemaCounter(counterType sqltelemetry.UserDefinedSchemaTelemetryType)
@@ -175,10 +188,10 @@ type TableHelpers interface {
 	// to this materialized view.
 	NextViewIndexID(view *scpb.View) catid.IndexID
 
-	// SecondaryIndexPartitioningDescriptor creates a new partitioning descriptor
+	// IndexPartitioningDescriptor creates a new partitioning descriptor
 	// for the secondary index element, or panics.
-	SecondaryIndexPartitioningDescriptor(
-		index *scpb.SecondaryIndex,
+	IndexPartitioningDescriptor(
+		index *scpb.Index,
 		partBy *tree.PartitionBy,
 	) catpb.PartitioningDescriptor
 
@@ -186,12 +199,15 @@ type TableHelpers interface {
 	ResolveTypeRef(typeref tree.ResolvableTypeReference) scpb.TypeT
 
 	// WrapExpression constructs an expression wrapper given an AST.
-	WrapExpression(expr tree.Expr) *scpb.Expression
+	WrapExpression(parentID catid.DescID, expr tree.Expr) *scpb.Expression
 
 	// ComputedColumnExpression returns a validated computed column expression
 	// and its type.
 	// TODO(postamar): make this more low-level instead of consuming an AST
-	ComputedColumnExpression(tbl *scpb.Table, d *tree.ColumnTableDef) (tree.Expr, scpb.TypeT)
+	ComputedColumnExpression(tbl *scpb.Table, d *tree.ColumnTableDef) tree.Expr
+
+	// IsTableEmpty returns if the table is empty or not.
+	IsTableEmpty(tbl *scpb.Table) bool
 }
 
 // ElementResultSet wraps the results of an element query.

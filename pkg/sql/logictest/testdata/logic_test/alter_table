@@ -774,7 +774,7 @@ CREATE TABLE default_err_test (foo text)
 statement ok
 INSERT INTO default_err_test VALUES ('foo'), ('bar'), ('baz')
 
-statement error some_msg
+statement error pgcode foo some_msg
 ALTER TABLE default_err_test ADD COLUMN id int DEFAULT crdb_internal.force_error('foo', 'some_msg')
 
 query T
@@ -1777,6 +1777,18 @@ ALTER TABLE t61762 ADD COLUMN v OIDVECTOR
 statement error VECTOR column types are unsupported
 ALTER TABLE t61762 ADD COLUMN v INT2VECTOR
 
+statement error VECTOR column types are unsupported
+ALTER TABLE t61762 ADD COLUMN v OIDVECTOR AS (ARRAY[1]) STORED
+
+statement error VECTOR column types are unsupported
+ALTER TABLE t61762 ADD COLUMN v OIDVECTOR AS (ARRAY[1]) VIRTUAL
+
+statement error VECTOR column types are unsupported
+ALTER TABLE t61762 ADD COLUMN v INT2VECTOR AS (ARRAY[1]) STORED
+
+statement error VECTOR column types are unsupported
+ALTER TABLE t61762 ADD COLUMN v INT2VECTOR AS (ARRAY[1]) VIRTUAL
+
 # Regression test for #60786. Handle in-transaction constraint ADD+DROP correctly.
 subtest regression_60786
 
@@ -1910,7 +1922,7 @@ SELECT count(usage_count)
 query I
 SELECT count(usage_count)
   FROM crdb_internal.feature_usage
- WHERE feature_name = 'sql.schema_changer.errors.uncategorized' and usage_count >= 4;
+ WHERE feature_name = 'sql.schema_changer.errors.uncategorized' and usage_count >= 1;
 ----
 1
 
@@ -2486,3 +2498,98 @@ CREATE TABLE public.t5 (
   rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
   CONSTRAINT t5_pkey PRIMARY KEY (rowid ASC)
 ) WITH (sql_stats_automatic_collection_min_stale_rows = 1234, sql_stats_automatic_collection_fraction_stale_rows = 0.15)
+
+subtest add_volatile_unique_column_81448
+
+statement ok
+create table t81448 (a int primary key);
+insert into t81448 values (1), (2), (3)
+
+statement ok
+alter table t81448 add column b float8 unique default (random())
+
+statement ok
+create table t81448_b as select b from t81448@t81448_pkey;
+
+# Make sure the rows in the index are the same as the rows in the table.
+
+query I
+select (select count(*) from t81448@t81448_b_key bk inner join t81448_b cp on (cp.b = bk.b))
+----
+3
+
+statement ok
+drop table t81448, t81448_b
+
+subtest sequence_is_referenced_by_ID
+
+statement ok
+DROP TABLE IF EXISTS tbl
+
+statement ok
+CREATE TABLE tbl (i INT PRIMARY KEY)
+
+statement ok
+CREATE SEQUENCE IF NOT EXISTS s1
+
+statement ok
+CREATE SEQUENCE IF NOT EXISTS s2
+
+statement ok
+ALTER TABLE tbl ADD COLUMN j INT NOT NULL DEFAULT nextval('s1') ON UPDATE nextval('s2')
+
+query TT
+SHOW CREATE TABLE tbl
+----
+tbl  CREATE TABLE public.tbl (
+     i INT8 NOT NULL,
+     j INT8 NOT NULL DEFAULT nextval('public.s1'::REGCLASS) ON UPDATE nextval('public.s2'::REGCLASS),
+     CONSTRAINT tbl_pkey PRIMARY KEY (i ASC)
+)
+
+# Now use `ALTER COLUMN` to swap the use of sequence 's1' and 's2'
+
+statement ok
+ALTER TABLE tbl ALTER COLUMN j SET DEFAULT nextval('s2')
+
+statement ok
+ALTER TABLE tbl ALTER COLUMN j SET ON UPDATE nextval('s1')
+
+query TT
+SHOW CREATE TABLE tbl
+----
+tbl  CREATE TABLE public.tbl (
+     i INT8 NOT NULL,
+     j INT8 NOT NULL DEFAULT nextval('public.s2'::REGCLASS) ON UPDATE nextval('public.s1'::REGCLASS),
+     CONSTRAINT tbl_pkey PRIMARY KEY (i ASC)
+)
+
+# Verify that adding not-null physical column with a default or computed expression
+# fails if the expression evaluates to NULL.
+subtest add_column_not_null
+
+statement ok
+CREATE TABLE t_add_column_not_null (i INT PRIMARY KEY);
+INSERT INTO t_add_column_not_null VALUES (1), (2), (3)
+
+statement error pgcode 23502 null value in column "j" violates not-null constraint
+ALTER TABLE t_add_column_not_null ADD COLUMN j INT NOT NULL DEFAULT (NULL:::INT)
+
+statement error pgcode 23502 null value in column "j" violates not-null constraint
+ALTER TABLE t_add_column_not_null ADD COLUMN j INT GENERATED ALWAYS AS (NULL:::INT) STORED NOT NULL;
+
+# Note that the UNIQUE here leads to a secondary index being built which will fail.
+statement error pgcode 23502 null value in column "j" violates not-null constraint
+ALTER TABLE t_add_column_not_null ADD COLUMN j INT GENERATED ALWAYS AS (NULL::INT) VIRTUAL NOT NULL UNIQUE;
+
+# Note that this should absolutely not succeed, but it does because of #81675.
+# We'll rely on that in order to test that the subsequent index build fails.
+# When addressing #81675, this portion of this test will need to be removed.
+statement ok
+ALTER TABLE t_add_column_not_null ADD COLUMN j INT GENERATED ALWAYS AS (NULL::INT) VIRTUAL NOT NULL;
+
+statement error pgcode 23502 null value in column "j" violates not-null constraint
+CREATE INDEX idx_j ON t_add_column_not_null (j);
+
+statement ok
+DROP TABLE t_add_column_not_null

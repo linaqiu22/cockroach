@@ -16,7 +16,9 @@ import (
 	"os"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/cli/clienturl"
 	"github.com/cockroachdb/cockroach/pkg/cli/clierrorplus"
+	"github.com/cockroachdb/cockroach/pkg/cli/cliflagcfg"
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
 	"github.com/cockroachdb/cockroach/pkg/cli/democluster"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
@@ -41,8 +43,7 @@ subcommands: e.g. "cockroach demo startrek". See --help for a full list.
 By default, the 'movr' dataset is pre-loaded. You can also use --no-example-database
 to avoid pre-loading a dataset.
 
-cockroach demo attempts to connect to a Cockroach Labs server to obtain a
-temporary enterprise license for demoing enterprise features and enable
+cockroach demo attempts to connect to a Cockroach Labs server to send
 telemetry back to Cockroach Labs. In order to disable this behavior, set the
 environment variable "COCKROACH_SKIP_ENABLING_DIAGNOSTIC_REPORTING" to true.
 `,
@@ -104,7 +105,7 @@ func init() {
 
 func incrementTelemetryCounters(cmd *cobra.Command) {
 	incrementDemoCounter(demo)
-	if flagSetForCmd(cmd).Lookup(cliflags.DemoNodes.Name).Changed {
+	if cliflagcfg.FlagSetForCmd(cmd).Lookup(cliflags.DemoNodes.Name).Changed {
 		incrementDemoCounter(nodes)
 	}
 	if demoCtx.Localities != nil {
@@ -121,7 +122,7 @@ func incrementTelemetryCounters(cmd *cobra.Command) {
 func checkDemoConfiguration(
 	cmd *cobra.Command, gen workload.Generator,
 ) (workload.Generator, error) {
-	f := flagSetForCmd(cmd)
+	f := cliflagcfg.FlagSetForCmd(cmd)
 	if gen == nil && !demoCtx.NoExampleDatabase {
 		// Use a default dataset unless prevented by --no-example-database.
 		gen = defaultGenerator
@@ -143,15 +144,19 @@ func checkDemoConfiguration(
 	}
 
 	demoCtx.DisableTelemetry = cluster.TelemetryOptOut()
-	// disableLicenseAcquisition can also be set by the user as an
-	// input flag, so make sure it include it when considering the final
-	// value of disableLicenseAcquisition.
-	demoCtx.DisableLicenseAcquisition =
-		demoCtx.DisableTelemetry || (democluster.GetAndApplyLicense == nil) || demoCtx.DisableLicenseAcquisition
+
+	// Whether or not we enable enterprise feature is a combination of:
+	//
+	// - whether the user wants them (they can disable enterprise
+	//   features explicitly with --no-license, e.g. for testing what
+	//   errors come up if no license is available)
+	// - whether enterprise features are enabled in this build, depending
+	//   on whether CCL code is included (and sets democluster.EnableEnterprise).
+	demoCtx.disableEnterpriseFeatures = democluster.EnableEnterprise == nil || demoCtx.disableEnterpriseFeatures
 
 	if demoCtx.GeoPartitionedReplicas {
 		geoFlag := "--" + cliflags.DemoGeoPartitionedReplicas.Name
-		if demoCtx.DisableLicenseAcquisition {
+		if demoCtx.disableEnterpriseFeatures {
 			return nil, errors.Newf("enterprise features are needed for this demo (%s)", geoFlag)
 		}
 
@@ -217,7 +222,7 @@ func runDemo(cmd *cobra.Command, gen workload.Generator) (resErr error) {
 
 	demoCtx.WorkloadGenerator = gen
 
-	c, err := democluster.NewDemoCluster(ctx, &demoCtx,
+	c, err := democluster.NewDemoCluster(ctx, &demoCtx.Context,
 		log.Infof,
 		log.Warningf,
 		log.Ops.Shoutf,
@@ -274,25 +279,29 @@ func runDemo(cmd *cobra.Command, gen workload.Generator) (resErr error) {
 		// Only print details about the telemetry configuration if the
 		// user has control over it.
 		if demoCtx.DisableTelemetry {
-			cliCtx.PrintlnUnlessEmbedded("#\n# Telemetry and automatic license acquisition disabled by configuration.")
-		} else if demoCtx.DisableLicenseAcquisition {
-			cliCtx.PrintlnUnlessEmbedded("#\n# Enterprise features disabled by OSS-only build.")
+			cliCtx.PrintlnUnlessEmbedded("#\n# Telemetry disabled by configuration.")
 		} else {
-			cliCtx.PrintlnUnlessEmbedded("#\n# This demo session will attempt to enable enterprise features\n" +
-				"# by acquiring a temporary license from Cockroach Labs in the background.\n" +
+			cliCtx.PrintlnUnlessEmbedded("#\n" +
+				"# This demo session will send telemetry to Cockroach Labs in the background.\n" +
 				"# To disable this behavior, set the environment variable\n" +
 				"# COCKROACH_SKIP_ENABLING_DIAGNOSTIC_REPORTING=true.")
 		}
+
+		if demoCtx.disableEnterpriseFeatures {
+			cliCtx.PrintlnUnlessEmbedded("#\n# Enterprise features are disabled by configuration.\n")
+		}
 	}
 
-	// Start license acquisition in the background.
-	licenseDone, err := c.AcquireDemoLicense(ctx)
-	if err != nil {
-		return clierrorplus.CheckAndMaybeShout(err)
+	if !demoCtx.disableEnterpriseFeatures {
+		fn, err := c.EnableEnterprise(ctx)
+		if err != nil {
+			return clierrorplus.CheckAndMaybeShout(err)
+		}
+		defer fn()
 	}
 
 	// Initialize the workload, if requested.
-	if err := c.SetupWorkload(ctx, licenseDone); err != nil {
+	if err := c.SetupWorkload(ctx); err != nil {
 		return clierrorplus.CheckAndMaybeShout(err)
 	}
 
@@ -331,21 +340,6 @@ func runDemo(cmd *cobra.Command, gen workload.Generator) (resErr error) {
 				certsDir,
 			)
 		}
-
-		// It's ok to do this twice (if workload setup already waited) because
-		// then the error return is guaranteed to be nil.
-		go func() {
-			if err := waitForLicense(licenseDone); err != nil {
-				_ = clierrorplus.CheckAndMaybeShout(err)
-			}
-		}()
-	} else {
-		// If we are not running an interactive shell, we need to wait to ensure
-		// that license acquisition is successful. If license acquisition is
-		// disabled, then a read on this channel will return immediately.
-		if err := waitForLicense(licenseDone); err != nil {
-			return clierrorplus.CheckAndMaybeShout(err)
-		}
 	}
 
 	conn, err := sqlCtx.MakeConn(c.GetConnURL())
@@ -354,11 +348,6 @@ func runDemo(cmd *cobra.Command, gen workload.Generator) (resErr error) {
 	}
 	defer func() { resErr = errors.CombineErrors(resErr, conn.Close()) }()
 
-	sqlCtx.ShellCtx.ParseURL = makeURLParser(cmd)
-	return sqlCtx.Run(conn)
-}
-
-func waitForLicense(licenseDone <-chan error) error {
-	err := <-licenseDone
-	return err
+	sqlCtx.ShellCtx.ParseURL = clienturl.MakeURLParserFn(cmd, cliCtx.clientOpts)
+	return sqlCtx.Run(ctx, conn)
 }

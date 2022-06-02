@@ -81,7 +81,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/scheduledlogging"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
-	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scrun"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/asof"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -222,10 +221,12 @@ var secondaryTenantZoneConfigsEnabled = settings.RegisterBoolSetting(
 var traceTxnThreshold = settings.RegisterDurationSetting(
 	settings.TenantWritable,
 	"sql.trace.txn.enable_threshold",
-	"duration beyond which all transactions are traced (set to 0 to "+
-		"disable). This setting is coarser grained than"+
-		"sql.trace.stmt.enable_threshold because it applies to all statements "+
-		"within a transaction as well as client communication (e.g. retries).", 0,
+	"enables tracing on all transactions; transactions open for longer than "+
+		"this duration will have their trace logged (set to 0 to disable); "+
+		"note that enabling this may have a negative performance impact; "+
+		"this setting is coarser-grained than sql.trace.stmt.enable_threshold "+
+		"because it applies to all statements within a transaction as well as "+
+		"client communication (e.g. retries)", 0,
 ).WithPublic()
 
 // TraceStmtThreshold is identical to traceTxnThreshold except it applies to
@@ -235,9 +236,11 @@ var traceTxnThreshold = settings.RegisterDurationSetting(
 var TraceStmtThreshold = settings.RegisterDurationSetting(
 	settings.TenantWritable,
 	"sql.trace.stmt.enable_threshold",
-	"duration beyond which all statements are traced (set to 0 to disable). "+
-		"This applies to individual statements within a transaction and is therefore "+
-		"finer-grained than sql.trace.txn.enable_threshold.",
+	"enables tracing on all statements; statements executing for longer than "+
+		"this duration will have their trace logged (set to 0 to disable); "+
+		"note that enabling this may have a negative performance impact; "+
+		"this setting applies to individual statements within a transaction and "+
+		"is therefore finer-grained than sql.trace.txn.enable_threshold",
 	0,
 ).WithPublic()
 
@@ -248,8 +251,8 @@ var TraceStmtThreshold = settings.RegisterDurationSetting(
 var traceSessionEventLogEnabled = settings.RegisterBoolSetting(
 	settings.TenantWritable,
 	"sql.trace.session_eventlog.enabled",
-	"set to true to enable session tracing. "+
-		"Note that enabling this may have a non-trivial negative performance impact.",
+	"set to true to enable session tracing; "+
+		"note that enabling this may have a negative performance impact",
 	false,
 ).WithPublic()
 
@@ -1210,7 +1213,7 @@ type ExecutorConfig struct {
 	UpgradeTestingKnobs                  *upgrade.TestingKnobs
 	PGWireTestingKnobs                   *PGWireTestingKnobs
 	SchemaChangerTestingKnobs            *SchemaChangerTestingKnobs
-	DeclarativeSchemaChangerTestingKnobs *scrun.TestingKnobs
+	DeclarativeSchemaChangerTestingKnobs *scexec.TestingKnobs
 	TypeSchemaChangerTestingKnobs        *TypeSchemaChangerTestingKnobs
 	GCJobTestingKnobs                    *GCJobTestingKnobs
 	DistSQLRunTestingKnobs               *execinfra.TestingKnobs
@@ -1262,6 +1265,9 @@ type ExecutorConfig struct {
 	// IndexBackfiller is used to backfill indexes. It is another rather circular
 	// object which mostly just holds on to an ExecConfig.
 	IndexBackfiller *IndexBackfillPlanner
+
+	// IndexMerger is also used to backfill indexes and is also rather circular.
+	IndexMerger *IndexBackfillerMergePlanner
 
 	// IndexValidator is used to validate indexes.
 	IndexValidator scexec.IndexValidator
@@ -1628,9 +1634,6 @@ func getPlanDistribution(
 		return physicalplan.LocalPlan
 	}
 
-	if _, singleTenant := nodeID.OptionalNodeID(); !singleTenant {
-		return physicalplan.LocalPlan
-	}
 	if distSQLMode == sessiondatapb.DistSQLOff {
 		return physicalplan.LocalPlan
 	}
@@ -3243,6 +3246,10 @@ func (m *sessionDataMutator) SetShowPrimaryKeyConstraintOnNotVisibleColumns(val 
 
 func (m *sessionDataMutator) SetTestingOptimizerRandomCostSeed(val int64) {
 	m.data.TestingOptimizerRandomCostSeed = val
+}
+
+func (m *sessionDataMutator) SetTrigramSimilarityThreshold(val float64) {
+	m.data.TrigramSimilarityThreshold = val
 }
 
 // Utility functions related to scrubbing sensitive information on SQL Stats.

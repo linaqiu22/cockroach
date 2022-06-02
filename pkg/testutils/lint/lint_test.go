@@ -445,6 +445,7 @@ func TestLint(t *testing.T) {
 					":!util/sdnotify/sdnotify_unix.go",
 					":!util/grpcutil", // GRPC_GO_* variables
 					":!roachprod",     // roachprod requires AWS environment variables
+					":!cli/env.go",    // The CLI needs the PGHOST variable.
 				},
 			},
 		} {
@@ -866,6 +867,7 @@ func TestLint(t *testing.T) {
 			":!util/tracing/*_test.go",
 			":!ccl/sqlproxyccl/tenantdirsvr/test_directory_svr.go",
 			":!ccl/sqlproxyccl/tenantdirsvr/test_simple_directory_svr.go",
+			":!ccl/sqlproxyccl/tenantdirsvr/test_static_directory_svr.go",
 		)
 		if err != nil {
 			t.Fatal(err)
@@ -1998,6 +2000,7 @@ func TestLint(t *testing.T) {
 			"../../sql/colexec/colexechash",
 			"../../sql/colexec/colexecjoin",
 			"../../sql/colexec/colexecproj",
+			"../../sql/colexec/colexecprojconst",
 			"../../sql/colexec/colexecsel",
 			"../../sql/colexec/colexecspan",
 			"../../sql/colexec/colexecwindow",

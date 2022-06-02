@@ -33,6 +33,8 @@ import (
     "github.com/cockroachdb/cockroach/pkg/roachpb"
     "github.com/cockroachdb/cockroach/pkg/security/username"
     "github.com/cockroachdb/cockroach/pkg/sql/lexbase"
+    "github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+    "github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
     "github.com/cockroachdb/cockroach/pkg/sql/privilege"
     "github.com/cockroachdb/cockroach/pkg/sql/roleoption"
     "github.com/cockroachdb/cockroach/pkg/sql/scanner"
@@ -877,7 +879,7 @@ func (u *sqlSymUnion) asTenantClause() tree.TenantID {
 %token <str> RANGE RANGES READ REAL REASON REASSIGN RECURSIVE RECURRING REF REFERENCES REFRESH
 %token <str> REGCLASS REGION REGIONAL REGIONS REGNAMESPACE REGPROC REGPROCEDURE REGROLE REGTYPE REINDEX
 %token <str> RELATIVE RELOCATE REMOVE_PATH RENAME REPEATABLE REPLACE REPLICATION
-%token <str> RELEASE RESET RESTORE RESTRICT RESTRICTED RESUME RETURNING RETRY REVISION_HISTORY
+%token <str> RELEASE RESET RESTART RESTORE RESTRICT RESTRICTED RESUME RETURNING RETRY REVISION_HISTORY
 %token <str> REVOKE RIGHT ROLE ROLES ROLLBACK ROLLUP ROUTINES ROW ROWS RSHIFT RULE RUNNING
 
 %token <str> SAVEPOINT SCANS SCATTER SCHEDULE SCHEDULES SCROLL SCHEMA SCHEMAS SCRUB SEARCH SECOND SELECT SEQUENCE SEQUENCES
@@ -927,7 +929,7 @@ func (u *sqlSymUnion) asTenantClause() tree.TenantID {
 // - TENANT_ALL is used to differentiate `ALTER TENANT <id>` from
 // `ALTER TENANT ALL`.
 %token NOT_LA NULLS_LA WITH_LA AS_LA GENERATED_ALWAYS GENERATED_BY_DEFAULT RESET_ALL ROLE_ALL
-%token USER_ALL ON_LA TENANT_ALL
+%token USER_ALL ON_LA TENANT_ALL SET_TRACING
 
 %union {
   id    int32
@@ -1730,7 +1732,8 @@ alter_view_stmt:
 //   [INCREMENT <increment>]
 //   [MINVALUE <minvalue> | NO MINVALUE]
 //   [MAXVALUE <maxvalue> | NO MAXVALUE]
-//   [START <start>]
+//   [START [WITH] <start>]
+//   [RESTART [[WITH] <restart>]]
 //   [[NO] CYCLE]
 // ALTER SEQUENCE [IF EXISTS] <name> RENAME TO <newname>
 // ALTER SEQUENCE [IF EXISTS] <name> SET SCHEMA <newschemaname>
@@ -1750,6 +1753,7 @@ alter_sequence_options_stmt:
   {
     $$.val = &tree.AlterSequence{Name: $5.unresolvedObjectName(), Options: $6.seqOpts(), IfExists: true}
   }
+
 
 // %Help: ALTER DATABASE - change the definition of a database
 // %Category: DDL
@@ -3958,7 +3962,7 @@ create_stats_option:
 // CREATE CHANGEFEED
 // FOR <targets> [INTO sink] [WITH <options>]
 //
-// Sink: Data caputre stream stream destination.  Enterprise only.
+// sink: data capture stream destination (Enterprise only)
 create_changefeed_stmt:
   CREATE CHANGEFEED FOR changefeed_targets opt_changefeed_sink opt_with_options
   {
@@ -4694,6 +4698,18 @@ grant_stmt:
   {
     return unimplemented(sqllex, "grant privileges on schema with")
   }
+| GRANT privileges ON ALL SEQUENCES IN SCHEMA schema_name_list TO role_spec_list opt_with_grant_option
+  {
+    $$.val = &tree.Grant{
+      Privileges: $2.privilegeList(),
+      Targets: tree.TargetList{
+        Schemas: $8.objectNamePrefixList(),
+        AllSequencesInSchema: true,
+      },
+      Grantees: $10.roleSpecList(),
+      WithGrantOption: $11.bool(),
+    }
+  }
 | GRANT privileges ON ALL TABLES IN SCHEMA schema_name_list TO role_spec_list opt_with_grant_option
   {
     $$.val = &tree.Grant{
@@ -4705,10 +4721,6 @@ grant_stmt:
       Grantees: $10.roleSpecList(),
       WithGrantOption: $11.bool(),
     }
-  }
-| GRANT privileges ON SEQUENCE error
-  {
-    return unimplementedWithIssueDetail(sqllex, 74780, "grant privileges on sequence")
   }
 | GRANT error // SHOW HELP: GRANT
 
@@ -4790,6 +4802,18 @@ revoke_stmt:
       GrantOptionFor: false,
     }
   }
+| REVOKE privileges ON ALL SEQUENCES IN SCHEMA schema_name_list FROM role_spec_list
+  {
+    $$.val = &tree.Revoke{
+      Privileges: $2.privilegeList(),
+      Targets: tree.TargetList{
+        Schemas: $8.objectNamePrefixList(),
+        AllSequencesInSchema: true,
+      },
+      Grantees: $10.roleSpecList(),
+      GrantOptionFor: false,
+    }
+  }
 | REVOKE GRANT OPTION FOR privileges ON ALL TABLES IN SCHEMA schema_name_list FROM role_spec_list
   {
     $$.val = &tree.Revoke{
@@ -4801,10 +4825,6 @@ revoke_stmt:
       Grantees: $13.roleSpecList(),
       GrantOptionFor: true,
     }
-  }
-| REVOKE privileges ON SEQUENCE error
-  {
-    return unimplemented(sqllex, "revoke privileges on sequence")
   }
 | REVOKE error // SHOW HELP: REVOKE
 
@@ -5071,7 +5091,19 @@ set_exprs_internal:
 // %SeeAlso: SHOW SESSION, RESET, DISCARD, SHOW, SET CLUSTER SETTING, SET TRANSACTION, SET LOCAL
 // WEBDOCS/set-vars.html
 set_session_stmt:
-  SET SESSION set_rest_more
+  SET_TRACING TRACING to_or_eq var_list
+	{
+    /* SKIP DOC */
+    // We need to recognize the "set tracing" specially here using syntax lookahead.
+    $$.val = &tree.SetTracing{Values: $4.exprs()}
+	}
+| SET_TRACING SESSION TRACING to_or_eq var_list
+	{
+    /* SKIP DOC */
+    // We need to recognize the "set tracing" specially here using syntax lookahead.
+    $$.val = &tree.SetTracing{Values: $5.exprs()}
+	}
+| SET SESSION set_rest_more
   {
     $$.val = $3.stmt()
   }
@@ -5132,14 +5164,7 @@ set_transaction_stmt:
 generic_set:
   var_name to_or_eq var_list
   {
-    // We need to recognize the "set tracing" specially here; couldn't make "set
-    // tracing" a different grammar rule because of ambiguity.
-    varName := $1.strs()
-    if len(varName) == 1 && varName[0] == "tracing" {
-      $$.val = &tree.SetTracing{Values: $3.exprs()}
-    } else {
-      $$.val = &tree.SetVar{Name: strings.Join($1.strs(), "."), Values: $3.exprs()}
-    }
+    $$.val = &tree.SetVar{Name: strings.Join($1.strs(), "."), Values: $3.exprs()}
   }
 
 set_rest:
@@ -5631,7 +5656,7 @@ session_var:
   {
     $$ = $1 + "." + strings.Join($2.strs(), ".")
   }
-// Although ALL, SESSION_USER, DATABASE, LC_COLLATE, and LC_CTYPE are
+// Although ALL, SESSION_USER, DATABASE, LC_COLLATE, LC_CTYPE, and TRACING are
 // identifiers for the purpose of SHOW, they lex as separate token types, so
 // they need separate rules.
 | ALL
@@ -5643,6 +5668,12 @@ session_var:
 | SESSION_USER
 | LC_COLLATE
 | LC_CTYPE
+| TRACING { /* SKIP DOC */ }
+| TRACING session_var_parts
+  {
+    /* SKIP DOC */
+    $$ = $1 + "." + strings.Join($2.strs(), ".")
+  }
 // TIME ZONE is special: it is two tokens, but is really the identifier "TIME ZONE".
 | TIME ZONE { $$ = "timezone" }
 | TIME error // SHOW HELP: SHOW SESSION
@@ -6770,11 +6801,11 @@ opt_on_targets_roles:
 targets:
   IDENT
   {
-    $$.val = tree.TargetList{Tables: tree.TablePatterns{&tree.UnresolvedName{NumParts:1, Parts: tree.NameParts{$1}}}}
+    $$.val = tree.TargetList{Tables: tree.TableAttrs{IsSequence: false, TablePatterns: tree.TablePatterns{&tree.UnresolvedName{NumParts:1, Parts: tree.NameParts{$1}}}}}
   }
 | col_name_keyword
   {
-    $$.val = tree.TargetList{Tables: tree.TablePatterns{&tree.UnresolvedName{NumParts:1, Parts: tree.NameParts{$1}}}}
+    $$.val = tree.TargetList{Tables: tree.TableAttrs{IsSequence: false, TablePatterns: tree.TablePatterns{&tree.UnresolvedName{NumParts:1, Parts: tree.NameParts{$1}}}}}
   }
 | unreserved_keyword
   {
@@ -6811,22 +6842,26 @@ targets:
     // of increasing (or attempting to modify) the grey magic occurring
     // here.
     $$.val = tree.TargetList{
-      Tables: tree.TablePatterns{&tree.UnresolvedName{NumParts:1, Parts: tree.NameParts{$1}}},
+      Tables: tree.TableAttrs{IsSequence: false, TablePatterns:tree.TablePatterns{&tree.UnresolvedName{NumParts:1, Parts: tree.NameParts{$1}}}},
       ForRoles: $1 == "role", // backdoor for "SHOW GRANTS ON ROLE" (no name list)
     }
   }
 | complex_table_pattern
   {
-    $$.val = tree.TargetList{Tables: tree.TablePatterns{$1.unresolvedName()}}
+    $$.val = tree.TargetList{Tables: tree.TableAttrs{IsSequence: false, TablePatterns: tree.TablePatterns{$1.unresolvedName()}}}
+  }
+| SEQUENCE table_pattern_list
+  {
+    $$.val = tree.TargetList{Tables: tree.TableAttrs{IsSequence: true, TablePatterns: $2.tablePatterns()}}
   }
 | table_pattern ',' table_pattern_list
   {
     remainderPats := $3.tablePatterns()
-    $$.val = tree.TargetList{Tables: append(tree.TablePatterns{$1.unresolvedName()}, remainderPats...)}
+    $$.val = tree.TargetList{Tables: tree.TableAttrs{IsSequence: false, TablePatterns: append(tree.TablePatterns{$1.unresolvedName()}, remainderPats...)}}
   }
 | TABLE table_pattern_list
   {
-    $$.val = tree.TargetList{Tables: $2.tablePatterns()}
+    $$.val = tree.TargetList{Tables: tree.TableAttrs{IsSequence: false, TablePatterns: $2.tablePatterns()}}
   }
 // TODO(knz): This should learn how to parse more complex expressions
 // and placeholders.
@@ -8091,6 +8126,11 @@ sequence_option_elem:
   AS typename                  {
                                   // Valid option values must be integer types (ex. int2, bigint)
                                   parsedType := $2.colType()
+                                  if parsedType == nil {
+                                      sqllex.(*lexer).lastError = pgerror.Newf(pgcode.UndefinedObject, "type %q does not exist", $2.val)
+                                      sqllex.(*lexer).populateErrorDetails()
+                                      return 1
+                                  }
                                   if parsedType.Family() != types.IntFamily {
                                       sqllex.Error(fmt.Sprintf("invalid integer type: %s", parsedType.SQLString()))
                                       return 1
@@ -8127,6 +8167,12 @@ sequence_option_elem:
                                  $$.val = tree.SequenceOption{Name: tree.SeqOptStart, IntVal: &x} }
 | START WITH signed_iconst64   { x := $3.int64()
                                  $$.val = tree.SequenceOption{Name: tree.SeqOptStart, IntVal: &x, OptionalWord: true} }
+| RESTART                      { $$.val = tree.SequenceOption{Name: tree.SeqOptRestart} }
+| RESTART signed_iconst64      { x := $2.int64()
+                                 $$.val = tree.SequenceOption{Name: tree.SeqOptRestart, IntVal: &x} }
+| RESTART WITH signed_iconst64 { x := $3.int64()
+                                 $$.val = tree.SequenceOption{Name: tree.SeqOptRestart, IntVal: &x, OptionalWord: true} }
+
 | VIRTUAL                      { $$.val = tree.SequenceOption{Name: tree.SeqOptVirtual} }
 
 // %Help: TRUNCATE - empty one or more tables
@@ -8215,9 +8261,18 @@ opt_in_database:
     $$ = ""
   }
 
+// This rule is used when SET is used as a clause in another statement,
+// like ALTER ROLE ... SET.
 set_or_reset_clause:
   SET set_rest
   {
+    $$.val = $2.setVar()
+  }
+| SET_TRACING set_rest
+  {
+    /* SKIP DOC */
+    // We need to recognize the "set tracing" specially here since we do a
+    // syntax lookahead and use a different token.
     $$.val = $2.setVar()
   }
 | RESET_ALL ALL
@@ -14270,6 +14325,7 @@ unreserved_keyword:
 | REPLACE
 | REPLICATION
 | RESET
+| RESTART
 | RESTORE
 | RESTRICT
 | RESTRICTED
@@ -14347,6 +14403,7 @@ unreserved_keyword:
 | TEXT
 | TIES
 | TRACE
+| TRACING
 | TRANSACTION
 | TRANSACTIONS
 | TRANSFER

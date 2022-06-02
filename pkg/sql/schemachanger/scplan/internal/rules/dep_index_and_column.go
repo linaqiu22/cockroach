@@ -60,7 +60,7 @@ func init() {
 		"index existence precedes index dependents",
 		scgraph.Precedence,
 		scpb.ToPublic,
-		element(scpb.Status_DELETE_ONLY,
+		element(scpb.Status_BACKFILL_ONLY,
 			(*scpb.PrimaryIndex)(nil),
 			(*scpb.SecondaryIndex)(nil),
 		),
@@ -73,11 +73,28 @@ func init() {
 		screl.IndexID,
 	).register()
 
+	(&depRuleSpec{
+		ruleName:         "partitioning set right after temp index existence",
+		edgeKind:         scgraph.SameStagePrecedence,
+		fromTargetStatus: scpb.Transient.Status(),
+		toTargetStatus:   scpb.ToPublic.Status(),
+		from: element(scpb.Status_DELETE_ONLY,
+			(*scpb.TemporaryIndex)(nil),
+		),
+		to: element(scpb.Status_PUBLIC,
+			(*scpb.IndexPartitioning)(nil),
+		),
+		joinAttrs: []screl.Attr{
+			screl.DescID,
+			screl.IndexID,
+		},
+	}).register()
+
 	depRule(
 		"partial predicate set right after secondary index existence",
 		scgraph.SameStagePrecedence,
 		scpb.ToPublic,
-		element(scpb.Status_DELETE_ONLY,
+		element(scpb.Status_BACKFILL_ONLY,
 			(*scpb.SecondaryIndex)(nil),
 		),
 		element(scpb.Status_PUBLIC,
@@ -155,19 +172,55 @@ func init() {
 	).register()
 }
 
+// These rules ensure that before an offline-backfilled index can begin
+// backfilling, the corresponding temporary index exists in WRITE_ONLY.
+func init() {
+	var (
+		from, fromTarget, fromNode         = targetNodeVars("from")
+		to, toTarget, toNode               = targetNodeVars("to")
+		descID, tempIndexID        rel.Var = "desc-id", "temp-index-id"
+	)
+	registerDepRule(
+		"temp index is WRITE_ONLY before backfill",
+		scgraph.Precedence,
+		fromNode, toNode,
+		screl.MustQuery(
+			from.Type(
+				(*scpb.TemporaryIndex)(nil),
+			),
+			to.Type(
+				(*scpb.PrimaryIndex)(nil),
+				(*scpb.SecondaryIndex)(nil),
+			),
+			descID.Entities(screl.DescID, from, to),
+			to.AttrEqVar(screl.TemporaryIndexID, tempIndexID),
+			from.AttrEqVar(screl.IndexID, tempIndexID),
+
+			fromTarget.AttrEq(screl.TargetStatus, scpb.Transient.Status()),
+			toTarget.AttrEq(screl.TargetStatus, scpb.ToPublic.Status()),
+
+			fromNode.AttrEq(screl.CurrentStatus, scpb.Status_WRITE_ONLY),
+			toNode.AttrEq(screl.CurrentStatus, scpb.Status_BACKFILLED),
+
+			screl.JoinTargetNode(from, fromTarget, fromNode),
+			screl.JoinTargetNode(to, toTarget, toNode),
+		),
+	)
+}
+
 // These rules ensure that column-dependent elements, like a column's name, its
 // DEFAULT expression, etc. appear once the column reaches a suitable state.
 // Vice-versa for column removal.
 func init() {
 	depRule(
-		"column type set right after column existence",
+		"column name set right after column existence",
 		scgraph.SameStagePrecedence,
 		scpb.ToPublic,
 		element(scpb.Status_DELETE_ONLY,
 			(*scpb.Column)(nil),
 		),
 		element(scpb.Status_PUBLIC,
-			(*scpb.ColumnType)(nil),
+			(*scpb.ColumnName)(nil),
 		),
 		screl.DescID,
 		screl.ColumnID,
@@ -213,7 +266,7 @@ func init() {
 			(*scpb.ColumnName)(nil),
 		),
 		element(scpb.Status_PUBLIC,
-			(*scpb.Column)(nil),
+			(*scpb.ColumnType)(nil),
 		),
 		screl.DescID,
 		screl.ColumnID,
@@ -349,30 +402,22 @@ func init() {
 		}
 		return false
 	}
-	columnInPrimaryIndex := func(from *scpb.Column, to scpb.Element) bool {
+	columnInIndex := func(from *scpb.Column, to scpb.Element) bool {
+		var idx *scpb.Index
 		switch to := to.(type) {
 		case *scpb.PrimaryIndex:
-			if columnInList(from.ColumnID, to.KeyColumnIDs) ||
-				columnInList(from.ColumnID, to.StoringColumnIDs) ||
-				columnInList(from.ColumnID, to.KeySuffixColumnIDs) {
-				return true
-			}
-		}
-		return false
-	}
-	columnInSecondaryIndex := func(from *scpb.Column, to scpb.Element) bool {
-		switch to := to.(type) {
+			idx = &to.Index
 		case *scpb.SecondaryIndex:
-			if columnInList(from.ColumnID, to.KeyColumnIDs) ||
-				columnInList(from.ColumnID, to.StoringColumnIDs) ||
-				columnInList(from.ColumnID, to.KeySuffixColumnIDs) {
-				return true
-			}
+			idx = &to.Index
+		case *scpb.TemporaryIndex:
+			idx = &to.Index
 		}
-		return false
-	}
-	columnInIndex := func(from *scpb.Column, to scpb.Element) bool {
-		return columnInPrimaryIndex(from, to) || columnInSecondaryIndex(from, to)
+		if idx == nil {
+			return false
+		}
+		return columnInList(from.ColumnID, idx.KeyColumnIDs) ||
+			columnInList(from.ColumnID, idx.StoringColumnIDs) ||
+			columnInList(from.ColumnID, idx.KeySuffixColumnIDs)
 	}
 
 	column, columnTarget, columnNode := targetNodeVars("column")
@@ -408,11 +453,66 @@ func init() {
 		element(scpb.Status_DELETE_ONLY,
 			(*scpb.Column)(nil),
 		),
-		element(scpb.Status_DELETE_ONLY,
+		element(scpb.Status_BACKFILL_ONLY,
 			(*scpb.PrimaryIndex)(nil),
 			(*scpb.SecondaryIndex)(nil),
 		),
 		screl.DescID,
 	).withFilter("column-featured-in-index", columnInIndex).register()
 
+	registerDepRule(
+		"column existence precedes temporary index existence",
+		scgraph.Precedence,
+		columnNode, indexNode,
+		screl.MustQuery(
+			index.Type((*scpb.TemporaryIndex)(nil)),
+			column.Type((*scpb.Column)(nil)),
+
+			tableID.Entities(screl.DescID, column, index),
+
+			indexTarget.AttrEq(screl.TargetStatus, scpb.Status_TRANSIENT_ABSENT),
+			columnTarget.AttrEq(screl.TargetStatus, scpb.Status_PUBLIC),
+			columnNode.AttrEq(screl.CurrentStatus, scpb.Status_DELETE_ONLY),
+			indexNode.AttrEq(screl.CurrentStatus, scpb.Status_DELETE_ONLY),
+
+			rel.Filter("column-featured-in-index", column, index)(columnInIndex),
+
+			screl.JoinTargetNode(column, columnTarget, columnNode),
+			screl.JoinTargetNode(index, indexTarget, indexNode),
+		),
+	)
+
+}
+
+// This rule ensures that columns depend on each other in increasing order.
+func init() {
+	laterCol, laterColTarget, laterColNode := targetNodeVars("laterColumn")
+	earlierCol, earlierColTarget, earlierColNode := targetNodeVars("earlierColumn")
+	var tableID, status, targetStatus rel.Var = "table-id", "status", "target-status"
+	isLaterColumn := func(from *scpb.Column, to *scpb.Column) bool {
+		return from.ColumnID < to.ColumnID
+	}
+
+	registerDepRule(
+		"ensure columns are in increasing order",
+		scgraph.SameStagePrecedence,
+		laterColNode, earlierColNode,
+		screl.MustQuery(
+			status.In(scpb.Status_WRITE_ONLY, scpb.Status_PUBLIC),
+			targetStatus.Eq(scpb.Status_PUBLIC),
+
+			laterCol.Type((*scpb.Column)(nil)),
+			earlierCol.Type((*scpb.Column)(nil)),
+
+			tableID.Entities(screl.DescID, laterCol, earlierCol),
+
+			rel.Filter("column-later-column-is-greater", laterCol, earlierCol)(isLaterColumn),
+
+			targetStatus.Entities(screl.TargetStatus, laterColTarget, earlierColTarget),
+			status.Entities(screl.CurrentStatus, laterColNode, earlierColNode),
+
+			screl.JoinTargetNode(laterCol, laterColTarget, laterColNode),
+			screl.JoinTargetNode(earlierCol, earlierColTarget, earlierColNode),
+		),
+	)
 }

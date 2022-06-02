@@ -1,5 +1,6 @@
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 load("//build:STRINGER.bzl", "stringer")
+load("//pkg/testutils/buildutil:buildutil.bzl", "disallowed_imports_test")
 load("//pkg/util/fsm/gen:REPORTS.bzl", "gen_reports")
 
 go_library(
@@ -180,6 +181,7 @@ go_library(
         "scrub_constraint.go",
         "scrub_fk.go",
         "scrub_index.go",
+        "scrub_unique_constraint.go",
         "select_name_resolution.go",
         "sequence.go",
         "sequence_select.go",
@@ -377,6 +379,7 @@ go_library(
         "//pkg/sql/schemachanger/scdeps",
         "//pkg/sql/schemachanger/scerrors",
         "//pkg/sql/schemachanger/scexec",
+        "//pkg/sql/schemachanger/scexec/backfiller",
         "//pkg/sql/schemachanger/scop",
         "//pkg/sql/schemachanger/scpb",
         "//pkg/sql/schemachanger/scplan",
@@ -511,7 +514,6 @@ go_test(
         "create_test.go",
         "database_test.go",
         "delete_preserving_index_test.go",
-        "dep_test.go",
         "descriptor_mutation_test.go",
         "distsql_physical_planner_test.go",
         "distsql_plan_backfill_test.go",
@@ -526,6 +528,8 @@ go_test(
         "explain_bundle_test.go",
         "explain_test.go",
         "explain_tree_test.go",
+        "grant_revoke_test.go",
+        "grant_role_test.go",
         "index_mutation_test.go",
         "indexbackfiller_test.go",
         "instrumentation_test.go",
@@ -623,6 +627,7 @@ go_test(
         "//pkg/rpc",
         "//pkg/rpc/nodedialer",
         "//pkg/security",
+        "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/security/username",
         "//pkg/server",
@@ -660,6 +665,7 @@ go_test(
         "//pkg/sql/pgwire/pgerror",
         "//pkg/sql/pgwire/pgwirebase",
         "//pkg/sql/physicalplan",
+        "//pkg/sql/privilege",
         "//pkg/sql/querycache",
         "//pkg/sql/randgen",
         "//pkg/sql/roleoption",
@@ -670,7 +676,9 @@ go_test(
         "//pkg/sql/rowenc/valueside",
         "//pkg/sql/rowexec",
         "//pkg/sql/rowinfra",
+        "//pkg/sql/schemachanger/scexec",
         "//pkg/sql/scrub",
+        "//pkg/sql/scrub/scrubtestutils",
         "//pkg/sql/sem/builtins",
         "//pkg/sql/sem/catconstants",
         "//pkg/sql/sem/catid",
@@ -691,7 +699,6 @@ go_test(
         "//pkg/startupmigrations",
         "//pkg/storage",
         "//pkg/testutils",
-        "//pkg/testutils/buildutil",
         "//pkg/testutils/jobutils",
         "//pkg/testutils/pgtest",
         "//pkg/testutils/serverutils",
@@ -785,4 +792,10 @@ gen_reports(
     dep = "//pkg/sql",
     starting_state_name = "stateNoTxn",
     transitions_variable = "TxnStateTransitions",
+)
+
+disallowed_imports_test(
+    "sql",
+    # TODO(#81380): This should be flipped to "True".
+    disallow_cdeps = False,
 )

@@ -334,7 +334,7 @@ var varGen = map[string]sessionVar{
 					"Setting DateStyle changes the volatility of timestamp/timestamptz/date::string "+
 						"and string::timestamp/timestamptz/date/time/timetz casts from immutable to stable. "+
 						"No computed columns, partial indexes, partitions and check constraints can "+
-						"use this casts. "+
+						"use these casts. "+
 						"Use to_char_with_style or parse_{timestamp,timestamptz,date,time,timetz} "+
 						"instead if you need these casts to work in the aforementioned cases.",
 				)
@@ -918,7 +918,7 @@ var varGen = map[string]sessionVar{
 		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
 			return fmt.Sprintf("%d", evalCtx.SessionData().DataConversionConfig.ExtraFloatDigits), nil
 		},
-		GlobalDefault: func(sv *settings.Values) string { return "0" },
+		GlobalDefault: func(sv *settings.Values) string { return "1" },
 	},
 
 	// CockroachDB extension. See docs on SessionData.ForceSavepointRestart.
@@ -973,7 +973,7 @@ var varGen = map[string]sessionVar{
 					),
 					"Setting IntervalStyle changes the volatility of string::interval or interval::string "+
 						"casts from immutable to stable. No computed columns, partial indexes, partitions "+
-						"and check constraints can use this casts. "+
+						"and check constraints can use these casts. "+
 						"Use to_char_with_style or parse_interval instead if you need these casts to work "+
 						"in the aforementioned cases.",
 				)
@@ -1234,6 +1234,30 @@ var varGen = map[string]sessionVar{
 
 	// See https://www.postgresql.org/docs/10/static/runtime-config-preset.html#GUC-SERVER-VERSION-NUM
 	`server_version_num`: makeReadOnlyVar(PgServerVersionNum),
+
+	`pg_trgm.similarity_threshold`: {
+		GetStringVal: makeFloatGetStringValFn(`pg_trgm.similarity_threshold`),
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return formatFloatAsPostgresSetting(evalCtx.SessionData().TrigramSimilarityThreshold), nil
+		},
+		// SetWithPlanner is defined in init(), as otherwise there is a circular
+		// initialization loop with the planner.
+		GlobalDefault: func(sv *settings.Values) string {
+			return ".3"
+		},
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			f, err := strconv.ParseFloat(s, 64)
+			if err != nil {
+				return err
+			}
+			if f < 0 || f > 1 {
+				return pgerror.Newf(pgcode.InvalidParameterValue,
+					"%f is out of range for similarity_threshold")
+			}
+			m.SetTrigramSimilarityThreshold(f)
+			return nil
+		},
+	},
 
 	// This is read-only in Postgres also.
 	// See https://www.postgresql.org/docs/14/sql-show.html and
@@ -2151,9 +2175,6 @@ func init() {
 		res := make([]string, 0, len(varGen))
 		for vName := range varGen {
 			res = append(res, vName)
-			if strings.Contains(vName, ".") {
-				panic(fmt.Sprintf(`no session variables with "." can be created as they are reserved for custom options, found %s`, vName))
-			}
 		}
 		sort.Strings(res)
 		return res

@@ -15,6 +15,7 @@ import (
 	gosql "database/sql"
 	"encoding/hex"
 	"fmt"
+	"regexp"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -26,14 +27,16 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scop"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan"
-	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scrun"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -97,7 +100,7 @@ func TestSchemaChangeWaitsForOtherSchemaChanges(t *testing.T) {
 					return nil
 				},
 			},
-			SQLDeclarativeSchemaChanger: &scrun.TestingKnobs{
+			SQLDeclarativeSchemaChanger: &scexec.TestingKnobs{
 				BeforeStage: func(p scplan.Plan, idx int) error {
 					// Assert that when job 3 is running, there are no mutations other
 					// than the ones associated with this schema change.
@@ -207,7 +210,7 @@ func TestSchemaChangeWaitsForOtherSchemaChanges(t *testing.T) {
 		var kvDB *kv.DB
 		params, _ := tests.CreateTestServerParams()
 		params.Knobs = base.TestingKnobs{
-			SQLDeclarativeSchemaChanger: &scrun.TestingKnobs{
+			SQLDeclarativeSchemaChanger: &scexec.TestingKnobs{
 				BeforeStage: func(p scplan.Plan, idx int) error {
 					// Verify that we never queue mutations for job 2 before finishing job
 					// 1.
@@ -326,7 +329,7 @@ func TestSchemaChangeWaitsForOtherSchemaChanges(t *testing.T) {
 		stmt2 := `DROP SCHEMA db.s2`
 		params, _ := tests.CreateTestServerParams()
 		params.Knobs = base.TestingKnobs{
-			SQLDeclarativeSchemaChanger: &scrun.TestingKnobs{
+			SQLDeclarativeSchemaChanger: &scexec.TestingKnobs{
 				BeforeStage: func(p scplan.Plan, stageIdx int) error {
 					if p.Params.ExecutionPhase != scop.PostCommitPhase {
 						return nil
@@ -419,7 +422,7 @@ func TestSchemaChangeWaitsForOtherSchemaChanges(t *testing.T) {
 		stmt2 := `DROP TABLE db.t2`
 		params, _ := tests.CreateTestServerParams()
 		params.Knobs = base.TestingKnobs{
-			SQLDeclarativeSchemaChanger: &scrun.TestingKnobs{
+			SQLDeclarativeSchemaChanger: &scexec.TestingKnobs{
 				BeforeStage: func(p scplan.Plan, stageIdx int) error {
 					if p.Params.ExecutionPhase != scop.PostCommitPhase {
 						return nil
@@ -521,7 +524,7 @@ func TestConcurrentSchemaChangesWait(t *testing.T) {
 		var kvDB *kv.DB
 		params, _ := tests.CreateTestServerParams()
 		params.Knobs = base.TestingKnobs{
-			SQLDeclarativeSchemaChanger: &scrun.TestingKnobs{
+			SQLDeclarativeSchemaChanger: &scexec.TestingKnobs{
 				BeforeWaitingForConcurrentSchemaChanges: func(_ []string) {
 					waitingForConcurrent <- struct{}{}
 				},
@@ -645,7 +648,6 @@ func TestConcurrentSchemaChangesWait(t *testing.T) {
 		`CREATE TABLE db.t2 (i INT PRIMARY KEY, a INT REFERENCES db.t)`,
 		`CREATE VIEW db.v AS SELECT a FROM db.t`,
 		`ALTER TABLE db.t RENAME TO db.new`,
-		`GRANT ALL ON db.t TO root`,
 		`TRUNCATE TABLE db.t`,
 		`DROP TABLE db.t`,
 	}
@@ -667,7 +669,7 @@ func TestSchemaChangerJobRunningStatus(t *testing.T) {
 	var jr *jobs.Registry
 	params, _ := tests.CreateTestServerParams()
 	params.Knobs = base.TestingKnobs{
-		SQLDeclarativeSchemaChanger: &scrun.TestingKnobs{
+		SQLDeclarativeSchemaChanger: &scexec.TestingKnobs{
 			AfterStage: func(p scplan.Plan, stageIdx int) error {
 				if p.Params.ExecutionPhase < scop.PostCommitPhase || stageIdx > 1 {
 					return nil
@@ -710,7 +712,7 @@ func TestSchemaChangerJobErrorDetails(t *testing.T) {
 	var jobIDValue int64
 	params, _ := tests.CreateTestServerParams()
 	params.Knobs = base.TestingKnobs{
-		SQLDeclarativeSchemaChanger: &scrun.TestingKnobs{
+		SQLDeclarativeSchemaChanger: &scexec.TestingKnobs{
 			AfterStage: func(p scplan.Plan, stageIdx int) error {
 				if p.Params.ExecutionPhase == scop.PostCommitPhase && stageIdx == 1 {
 					atomic.StoreInt64(&jobIDValue, int64(p.JobID))
@@ -785,7 +787,7 @@ func TestInsertDuringAddColumnNotWritingToCurrentPrimaryIndex(t *testing.T) {
 				return nil
 			},
 		},
-		SQLDeclarativeSchemaChanger: &scrun.TestingKnobs{
+		SQLDeclarativeSchemaChanger: &scexec.TestingKnobs{
 			BeforeStage: func(p scplan.Plan, stageIdx int) error {
 				// Verify that we never get a mutation ID not associated with the schema
 				// change that is running.
@@ -860,10 +862,27 @@ func TestInsertDuringAddColumnNotWritingToCurrentPrimaryIndex(t *testing.T) {
 	results := tdb.QueryStr(t, `
 		SELECT message
 		FROM [SHOW KV TRACE FOR SESSION]
-		WHERE message LIKE 'CPut %' OR message LIKE 'InitPut %'`)
+		WHERE message LIKE 'CPut %' OR message LIKE 'Put %'`)
 	require.GreaterOrEqual(t, len(results), 2)
 	require.Equal(t, fmt.Sprintf("CPut /Table/%d/1/10/0 -> /TUPLE/", desc.GetID()), results[0][0])
-	require.Equal(t, fmt.Sprintf("InitPut /Table/%d/2/10/0 -> /TUPLE/2:2:Int/100", desc.GetID()), results[1][0])
+
+	// The write to the temporary index is wrapped for the delete-preserving
+	// encoding. We need to unwrap it to verify its data. To do this, we pull
+	// the hex-encoded wrapped data, decode it, then pretty-print it to ensure
+	// it looks right.
+	wrappedPutRE := regexp.MustCompile(fmt.Sprintf(
+		"Put /Table/%d/3/10/0 -> /BYTES/0x([0-9a-f]+)$", desc.GetID(),
+	))
+	match := wrappedPutRE.FindStringSubmatch(results[1][0])
+	require.NotEmpty(t, match)
+	var val roachpb.Value
+	wrapped, err := hex.DecodeString(match[1])
+	require.NoError(t, err)
+	val.SetBytes(wrapped)
+	wrapper, err := rowenc.DecodeWrapper(&val)
+	require.NoError(t, err)
+	val.SetTagAndData(wrapper.Value)
+	require.Equal(t, "/TUPLE/2:2:Int/100", val.PrettyPrint())
 }
 
 // TestDropJobCancelable ensure that certain operations like

@@ -15,11 +15,14 @@ var pgjdbcBlocklists = blocklistsForVersion{
 	{"v21.1", "pgjdbcBlockList21_1", pgjdbcBlockList21_1, "pgjdbcIgnoreList21_1", pgjdbcIgnoreList21_1},
 	{"v21.2", "pgjdbcBlockList21_2", pgjdbcBlockList21_2, "pgjdbcIgnoreList21_2", pgjdbcIgnoreList21_2},
 	{"v22.1", "pgjdbcBlockList22_1", pgjdbcBlockList22_1, "pgjdbcIgnoreList22_1", pgjdbcIgnoreList22_1},
+	{"v22.2", "pgjdbcBlockList22_2", pgjdbcBlockList22_2, "pgjdbcIgnoreList22_2", pgjdbcIgnoreList22_2},
 }
 
 // Please keep these lists alphabetized for easy diffing.
 // After a failed run, an updated version of this blocklist should be available
 // in the test log.
+var pgjdbcBlockList22_2 = pgjdbcBlockList22_1
+
 var pgjdbcBlockList22_1 = blocklist{
 	"org.postgresql.core.OidValuesCorrectnessTest.testValue[oidName=BOX, oidValue=603]":                                                                                        "unknown",
 	"org.postgresql.core.OidValuesCorrectnessTest.testValue[oidName=CIDR, oidValue=650]":                                                                                       "unknown",
@@ -542,35 +545,8 @@ var pgjdbcBlockList22_1 = blocklist{
 	"org.postgresql.test.jdbc2.TimezoneTest.testSetDate":                                                                                                                       "41776",
 	"org.postgresql.test.jdbc2.TimezoneTest.testSetTime":                                                                                                                       "41776",
 	"org.postgresql.test.jdbc2.TimezoneTest.testSetTimestamp":                                                                                                                  "41776",
-	"org.postgresql.test.jdbc2.UpdateableResultTest.simpleAndUpdateableSameQuery":                                                                                              "unknown",
-	"org.postgresql.test.jdbc2.UpdateableResultTest.test2193":                                                                                                                  "unknown",
 	"org.postgresql.test.jdbc2.UpdateableResultTest.testArray":                                                                                                                 "26925",
-	"org.postgresql.test.jdbc2.UpdateableResultTest.testBadColumnIndexes":                                                                                                      "unknown",
-	"org.postgresql.test.jdbc2.UpdateableResultTest.testCancelRowUpdates":                                                                                                      "unknown",
-	"org.postgresql.test.jdbc2.UpdateableResultTest.testDeleteRows":                                                                                                            "unknown",
-	"org.postgresql.test.jdbc2.UpdateableResultTest.testInsertRowIllegalMethods":                                                                                               "unknown",
-	"org.postgresql.test.jdbc2.UpdateableResultTest.testMultiColumnUpdate":                                                                                                     "unknown",
-	"org.postgresql.test.jdbc2.UpdateableResultTest.testMultiColumnUpdateWithoutAllColumns":                                                                                    "unknown",
-	"org.postgresql.test.jdbc2.UpdateableResultTest.testMultiColumnUpdateWithoutPrimaryKey":                                                                                    "unknown",
-	"org.postgresql.test.jdbc2.UpdateableResultTest.testNoUniqueNotUpdateable":                                                                                                 "unknown",
 	"org.postgresql.test.jdbc2.UpdateableResultTest.testOidUpdatable":                                                                                                          "unknown",
-	"org.postgresql.test.jdbc2.UpdateableResultTest.testPositioning":                                                                                                           "unknown",
-	"org.postgresql.test.jdbc2.UpdateableResultTest.testPrimaryAndUniqueUpdateableByPrimary":                                                                                   "unknown",
-	"org.postgresql.test.jdbc2.UpdateableResultTest.testPrimaryAndUniqueUpdateableByUnique":                                                                                    "unknown",
-	"org.postgresql.test.jdbc2.UpdateableResultTest.testReturnSerial":                                                                                                          "unknown",
-	"org.postgresql.test.jdbc2.UpdateableResultTest.testUniqueWithNotNullableColumnUpdateable":                                                                                 "unknown",
-	"org.postgresql.test.jdbc2.UpdateableResultTest.testUniqueWithNullAndNotNullableColumnUpdateable":                                                                          "unknown",
-	"org.postgresql.test.jdbc2.UpdateableResultTest.testUniqueWithNullableColumnNotUpdateable":                                                                                 "unknown",
-	"org.postgresql.test.jdbc2.UpdateableResultTest.testUniqueWithNullableColumnsNotUpdatable":                                                                                 "unknown",
-	"org.postgresql.test.jdbc2.UpdateableResultTest.testUpdateBoolean":                                                                                                         "unknown",
-	"org.postgresql.test.jdbc2.UpdateableResultTest.testUpdateDate":                                                                                                            "unknown",
-	"org.postgresql.test.jdbc2.UpdateableResultTest.testUpdateReadOnlyResultSet":                                                                                               "unknown",
-	"org.postgresql.test.jdbc2.UpdateableResultTest.testUpdateSelectOnly":                                                                                                      "unknown",
-	"org.postgresql.test.jdbc2.UpdateableResultTest.testUpdateStreams":                                                                                                         "unknown",
-	"org.postgresql.test.jdbc2.UpdateableResultTest.testUpdateTimestamp":                                                                                                       "unknown",
-	"org.postgresql.test.jdbc2.UpdateableResultTest.testUpdateable":                                                                                                            "unknown",
-	"org.postgresql.test.jdbc2.UpdateableResultTest.testUpdateablePreparedStatement":                                                                                           "unknown",
-	"org.postgresql.test.jdbc2.UpdateableResultTest.testZeroRowResult":                                                                                                         "unknown",
 	"org.postgresql.test.jdbc3.CompositeTest.testComplexArgumentSelect":                                                                                                        "27793",
 	"org.postgresql.test.jdbc3.CompositeTest.testComplexSelect":                                                                                                                "27793",
 	"org.postgresql.test.jdbc3.CompositeTest.testComplexTableNameMetadata":                                                                                                     "27793",
@@ -3344,6 +3320,8 @@ var pgjdbcBlockList20_2 = blocklist{
 	"org.postgresql.test.xa.XADataSourceTest.testTwoPhaseCommit":                                                                                                               "22329",
 	"org.postgresql.test.xa.XADataSourceTest.testWrapperEquals":                                                                                                                "22329",
 }
+
+var pgjdbcIgnoreList22_2 = pgjdbcIgnoreList22_1
 
 var pgjdbcIgnoreList22_1 = pgjdbcIgnoreList21_2
 

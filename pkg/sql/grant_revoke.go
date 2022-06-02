@@ -61,11 +61,17 @@ func (p *planner) Grant(ctx context.Context, n *tree.Grant) (planNode, error) {
 		targets:         n.Targets,
 		grantees:        grantees,
 		desiredprivs:    n.Privileges,
-		changePrivilege: func(privDesc *catpb.PrivilegeDescriptor, privileges privilege.List, grantee username.SQLUsername) {
+		changePrivilege: func(
+			privDesc *catpb.PrivilegeDescriptor, privileges privilege.List, grantee username.SQLUsername,
+		) (changed bool) {
+			// Grant the desired privileges to grantee, and return true
+			// if privileges have actually been changed due to this `GRANT``.
+			granteePrivsBeforeGrant := *(privDesc.FindOrCreateUser(grantee))
 			privDesc.Grant(grantee, privileges, n.WithGrantOption)
+			granteePrivsAfterGrant := *(privDesc.FindOrCreateUser(grantee))
+			return granteePrivsBeforeGrant != granteePrivsAfterGrant
 		},
-		grantOn:          grantOn,
-		granteesNameList: n.Grantees,
+		grantOn: grantOn,
 	}, nil
 }
 
@@ -94,11 +100,23 @@ func (p *planner) Revoke(ctx context.Context, n *tree.Revoke) (planNode, error) 
 		targets:         n.Targets,
 		grantees:        grantees,
 		desiredprivs:    n.Privileges,
-		changePrivilege: func(privDesc *catpb.PrivilegeDescriptor, privileges privilege.List, grantee username.SQLUsername) {
+		changePrivilege: func(
+			privDesc *catpb.PrivilegeDescriptor, privileges privilege.List, grantee username.SQLUsername,
+		) (changed bool) {
+			granteePrivs, ok := privDesc.FindUser(grantee)
+			if !ok {
+				return false
+			}
+			granteePrivsBeforeGrant := *granteePrivs // Make a copy of the grantee's privileges before revoke.
 			privDesc.Revoke(grantee, privileges, grantOn, n.GrantOptionFor)
+			granteePrivs, ok = privDesc.FindUser(grantee)
+			// Revoke results in any privilege changes if
+			//   1. grantee's entry is removed from the privilege descriptor, or
+			//   2. grantee's entry is changed in its content.
+			privsChanges := !ok || granteePrivsBeforeGrant != *granteePrivs
+			return privsChanges
 		},
-		grantOn:          grantOn,
-		granteesNameList: n.Grantees,
+		grantOn: grantOn,
 	}, nil
 }
 
@@ -108,13 +126,8 @@ type changePrivilegesNode struct {
 	targets         tree.TargetList
 	grantees        []username.SQLUsername
 	desiredprivs    privilege.List
-	changePrivilege func(*catpb.PrivilegeDescriptor, privilege.List, username.SQLUsername)
+	changePrivilege func(*catpb.PrivilegeDescriptor, privilege.List, username.SQLUsername) (changed bool)
 	grantOn         privilege.ObjectType
-
-	// granteesNameList is used for creating an AST node for alter default
-	// privileges inside changePrivilegesNode's startExec.
-	// This is required for getting the pre-normalized name to construct the AST.
-	granteesNameList tree.RoleSpecList
 }
 
 // ReadingOwnWrites implements the planNodeReadingOwnWrites interface.
@@ -186,8 +199,14 @@ func (n *changePrivilegesNode) startExec(params runParams) error {
 			}
 		}
 
+		// descPrivsChanged is true if any privileges are changed on `descriptor` as a result of
+		// the `GRANT` or `REVOKE` query. This allows us to no-op the `GRANT` or `REVOKE` if
+		// it does not actually result in any privilege change.
+		descPrivsChanged := false
+
 		if len(n.desiredprivs) > 0 {
 			grantPresent, allPresent := false, false
+			var sequencePrivilegesNoOp privilege.List
 			for _, priv := range n.desiredprivs {
 				// Only allow granting/revoking privileges that the requesting
 				// user themselves have on the descriptor.
@@ -196,6 +215,19 @@ func (n *changePrivilegesNode) startExec(params runParams) error {
 				}
 				grantPresent = grantPresent || priv == privilege.GRANT
 				allPresent = allPresent || priv == privilege.ALL
+
+				if n.grantOn == privilege.Sequence {
+					switch priv {
+					case privilege.ALL,
+						privilege.USAGE,
+						privilege.UPDATE,
+						privilege.SELECT,
+						privilege.DROP,
+						privilege.GRANT:
+					default:
+						sequencePrivilegesNoOp = append(sequencePrivilegesNoOp, priv)
+					}
+				}
 			}
 			privileges := descriptor.GetPrivileges()
 
@@ -217,7 +249,8 @@ func (n *changePrivilegesNode) startExec(params runParams) error {
 			}
 
 			for _, grantee := range n.grantees {
-				n.changePrivilege(privileges, n.desiredprivs, grantee)
+				changed := n.changePrivilege(privileges, n.desiredprivs, grantee)
+				descPrivsChanged = descPrivsChanged || changed
 
 				// TODO (sql-exp): remove the rest of this loop in 22.2.
 				granteeHasGrantPriv := privileges.CheckPrivilege(grantee, privilege.GRANT)
@@ -227,10 +260,11 @@ func (n *changePrivilegesNode) startExec(params runParams) error {
 				}
 				if !n.withGrantOption && (grantPresent || allPresent || (granteeHasGrantPriv && n.isGrant)) {
 					if n.isGrant {
-						privileges.GrantPrivilegeToGrantOptions(grantee, true /*isGrant*/)
+						changed = privileges.GrantPrivilegeToGrantOptions(grantee, true /*isGrant*/)
 					} else {
-						privileges.GrantPrivilegeToGrantOptions(grantee, false /*isGrant*/)
+						changed = privileges.GrantPrivilegeToGrantOptions(grantee, false /*isGrant*/)
 					}
+					descPrivsChanged = descPrivsChanged || changed
 				}
 			}
 
@@ -240,6 +274,16 @@ func (n *changePrivilegesNode) startExec(params runParams) error {
 					errors.WithHint(
 						pgnotice.Newf("%s", noticeMessage),
 						"please use WITH GRANT OPTION",
+					),
+				)
+			}
+
+			if len(sequencePrivilegesNoOp) > 0 {
+				params.p.BufferClientNotice(
+					ctx,
+					pgnotice.Newf(
+						"some privileges have no effect on sequences: %s",
+						sequencePrivilegesNoOp.SortedNames(),
 					),
 				)
 			}
@@ -259,6 +303,11 @@ func (n *changePrivilegesNode) startExec(params runParams) error {
 			if err != nil {
 				return err
 			}
+		}
+
+		if !descPrivsChanged {
+			// no privileges will be changed from this 'GRANT' or 'REVOKE', skip it.
+			continue
 		}
 
 		eventDetails := eventpb.CommonSQLPrivilegeEventDetails{}
@@ -357,8 +406,10 @@ func (n *changePrivilegesNode) startExec(params runParams) error {
 	// Record the privilege changes in the event log. This is an
 	// auditable log event and is recorded in the same transaction as
 	// the table descriptor update.
-	if err := params.p.logEvents(params.ctx, events...); err != nil {
-		return err
+	if events != nil {
+		if err := params.p.logEvents(params.ctx, events...); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -374,6 +425,9 @@ func getGrantOnObject(targets tree.TargetList, incIAMFunc func(on string)) privi
 	case targets.Databases != nil:
 		incIAMFunc(sqltelemetry.OnDatabase)
 		return privilege.Database
+	case targets.AllSequencesInSchema:
+		incIAMFunc(sqltelemetry.OnAllSequencesInSchema)
+		return privilege.Sequence
 	case targets.AllTablesInSchema:
 		incIAMFunc(sqltelemetry.OnAllTablesInSchema)
 		return privilege.Table
@@ -384,6 +438,10 @@ func getGrantOnObject(targets tree.TargetList, incIAMFunc func(on string)) privi
 		incIAMFunc(sqltelemetry.OnType)
 		return privilege.Type
 	default:
+		if targets.Tables.IsSequence {
+			incIAMFunc(sqltelemetry.OnSequence)
+			return privilege.Sequence
+		}
 		incIAMFunc(sqltelemetry.OnTable)
 		return privilege.Table
 	}

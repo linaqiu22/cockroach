@@ -12,15 +12,19 @@ package scdeps
 
 import (
 	"context"
+	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec/backfiller"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scrun"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -33,7 +37,8 @@ func NewJobRunDependencies(
 	db *kv.DB,
 	internalExecutor sqlutil.InternalExecutor,
 	backfiller scexec.Backfiller,
-	rangeCounter RangeCounter,
+	merger scexec.Merger,
+	rangeCounter backfiller.RangeCounter,
 	eventLoggerFactory EventLoggerFactory,
 	jobRegistry *jobs.Registry,
 	job *jobs.Job,
@@ -41,7 +46,8 @@ func NewJobRunDependencies(
 	settings *cluster.Settings,
 	indexValidator scexec.IndexValidator,
 	commentUpdaterFactory scexec.DescriptorMetadataUpdaterFactory,
-	testingKnobs *scrun.TestingKnobs,
+	statsRefresher scexec.StatsRefresher,
+	testingKnobs *scexec.TestingKnobs,
 	statements []string,
 	sessionData *sessiondata.SessionData,
 	kvTrace bool,
@@ -51,6 +57,7 @@ func NewJobRunDependencies(
 		db:                    db,
 		internalExecutor:      internalExecutor,
 		backfiller:            backfiller,
+		merger:                merger,
 		rangeCounter:          rangeCounter,
 		eventLoggerFactory:    eventLoggerFactory,
 		jobRegistry:           jobRegistry,
@@ -63,6 +70,7 @@ func NewJobRunDependencies(
 		commentUpdaterFactory: commentUpdaterFactory,
 		sessionData:           sessionData,
 		kvTrace:               kvTrace,
+		statsRefresher:        statsRefresher,
 	}
 }
 
@@ -71,9 +79,11 @@ type jobExecutionDeps struct {
 	db                    *kv.DB
 	internalExecutor      sqlutil.InternalExecutor
 	eventLoggerFactory    func(txn *kv.Txn) scexec.EventLogger
+	statsRefresher        scexec.StatsRefresher
 	backfiller            scexec.Backfiller
+	merger                scexec.Merger
 	commentUpdaterFactory scexec.DescriptorMetadataUpdaterFactory
-	rangeCounter          RangeCounter
+	rangeCounter          backfiller.RangeCounter
 	jobRegistry           *jobs.Registry
 	job                   *jobs.Job
 	kvTrace               bool
@@ -82,7 +92,7 @@ type jobExecutionDeps struct {
 
 	codec        keys.SQLCodec
 	settings     *cluster.Settings
-	testingKnobs *scrun.TestingKnobs
+	testingKnobs *scexec.TestingKnobs
 	statements   []string
 	sessionData  *sessiondata.SessionData
 }
@@ -97,6 +107,7 @@ func (d *jobExecutionDeps) ClusterSettings() *cluster.Settings {
 // WithTxnInJob implements the scrun.JobRunDependencies interface.
 func (d *jobExecutionDeps) WithTxnInJob(ctx context.Context, fn scrun.JobTxnFunc) error {
 	var createdJobs []jobspb.JobID
+	var tableStatsToRefresh []descpb.ID
 	err := d.collectionFactory.Txn(ctx, d.internalExecutor, d.db, func(
 		ctx context.Context, txn *kv.Txn, descriptors *descs.Collection,
 	) error {
@@ -109,27 +120,32 @@ func (d *jobExecutionDeps) WithTxnInJob(ctx context.Context, fn scrun.JobTxnFunc
 				jobRegistry:        d.jobRegistry,
 				indexValidator:     d.indexValidator,
 				eventLogger:        d.eventLoggerFactory(txn),
+				statsRefresher:     d.statsRefresher,
 				schemaChangerJobID: d.job.ID(),
 				kvTrace:            d.kvTrace,
 			},
 			backfiller: d.backfiller,
-			backfillTracker: newBackfillTracker(d.codec,
-				newBackfillTrackerConfig(ctx, d.codec, d.db, d.rangeCounter, d.job),
-				convertFromJobBackfillProgress(
-					d.codec, pl.GetNewSchemaChange().BackfillProgress,
-				),
+			merger:     d.merger,
+			backfillerTracker: backfiller.NewTracker(
+				d.codec,
+				d.rangeCounter,
+				d.job,
+				pl.GetNewSchemaChange().BackfillProgress,
+				pl.GetNewSchemaChange().MergeProgress,
 			),
-			periodicProgressFlusher: newPeriodicProgressFlusherForIndexBackfill(d.settings),
+			periodicProgressFlusher: backfiller.NewPeriodicProgressFlusherForIndexBackfill(d.settings),
 			statements:              d.statements,
 			user:                    pl.UsernameProto.Decode(),
 			clock:                   NewConstantClock(timeutil.FromUnixMicros(pl.StartedMicros)),
 			commentUpdaterFactory:   d.commentUpdaterFactory,
 			sessionData:             d.sessionData,
+			testingKnobs:            d.testingKnobs,
 		}
 		if err := fn(ctx, ed); err != nil {
 			return err
 		}
 		createdJobs = ed.CreatedJobs()
+		tableStatsToRefresh = ed.getTablesForStatsRefresh()
 		return nil
 	})
 	if err != nil {
@@ -137,6 +153,21 @@ func (d *jobExecutionDeps) WithTxnInJob(ctx context.Context, fn scrun.JobTxnFunc
 	}
 	if len(createdJobs) > 0 {
 		d.jobRegistry.NotifyToResume(ctx, createdJobs...)
+	}
+	if len(tableStatsToRefresh) > 0 {
+		err := d.collectionFactory.Txn(ctx, d.internalExecutor, d.db, func(ctx context.Context, txn *kv.Txn, descriptors *descs.Collection) error {
+			for _, id := range tableStatsToRefresh {
+				tbl, err := descriptors.GetImmutableTableByID(ctx, txn, id, tree.ObjectLookupFlagsWithRequired())
+				if err != nil {
+					return err
+				}
+				d.statsRefresher.NotifyMutation(tbl, math.MaxInt32)
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }

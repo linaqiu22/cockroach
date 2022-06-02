@@ -47,6 +47,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/gcjob"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
@@ -453,9 +454,35 @@ func TestRollbackOfAddingTable(t *testing.T) {
 	_, err := sqlDB.Exec(`CREATE DATABASE d`)
 	require.NoError(t, err)
 
+	// Create a table that the view depends on.
+	_, err = sqlDB.Exec(`
+CREATE TYPE d.animals as ENUM('cat');
+CREATE SEQUENCE d.sq1;
+CREATE TABLE d.t1 (val INT DEFAULT nextval('d.sq1'), animal d.animals);
+`)
+	require.NoError(t, err)
+
 	// This view creation will fail and eventually rollback.
-	_, err = sqlDB.Exec(`CREATE MATERIALIZED VIEW d.v AS SELECT 1`)
-	require.EqualError(t, err, "pq: boom")
+	_, err = sqlDB.Exec(
+		`BEGIN;
+CREATE MATERIALIZED VIEW d.v AS SELECT val FROM d.t1;
+CREATE VIEW d.v1 AS SELECT A.val AS  val2, B.val AS val1, 'cat':::d.animals AS ANIMAL, c.last_value FROM d.v AS A, d.t1 AS B, d.sq1 as C;
+COMMIT;`)
+	require.EqualError(t, err, "pq: transaction committed but schema change aborted with error: (XXUUU): boom")
+
+	// Validate existing back references are intact.
+	_, err = sqlDB.Exec("DROP TYPE d.animals;")
+	require.Error(t, err, "pq: cannot drop type \"animals\" because other objects ([d.public.t1]) still depend on it")
+	_, err = sqlDB.Exec("DROP SEQUENCE d.sq1;")
+	require.Error(t, err, "pq: cannot drop type \"animals\" because other objects ([d.public.t1]) still depend on it")
+
+	// Ensure that the dependent objects can still be dropped.
+	_, err = sqlDB.Exec(`
+DROP TABLE d.t1;
+DROP TYPE d.animals;
+DROP SEQUENCE d.sq1;
+`)
+	require.NoError(t, err)
 
 	// Get the view descriptor we just created and verify that it's in the
 	// dropping state. We're unable to access the descriptor via the usual means
@@ -463,8 +490,11 @@ func TestRollbackOfAddingTable(t *testing.T) {
 	// and once we move the table to the DROP state we also remove the namespace
 	// entry. So we just get the most recent descriptor.
 	var descBytes []byte
-	row := sqlDB.QueryRow(`SELECT descriptor FROM system.descriptor ORDER BY id DESC LIMIT 1`)
-	require.NoError(t, row.Scan(&descBytes))
+	rows, err := sqlDB.Query(`SELECT descriptor FROM system.descriptor ORDER BY id DESC LIMIT 2`)
+	require.NoError(t, err)
+	require.Equal(t, rows.Next(), true)
+	require.Equal(t, rows.Next(), true)
+	require.NoError(t, rows.Scan(&descBytes))
 	var desc descpb.Descriptor
 	require.NoError(t, protoutil.Unmarshal(descBytes, &desc))
 	//nolint:descriptormarshal
@@ -3302,18 +3332,18 @@ func TestPrimaryKeyDropIndexNotCancelable(t *testing.T) {
 
 	ctx := context.Background()
 	var db *gosql.DB
-	shouldAttemptCancel := true
+	var shouldAttemptCancel syncutil.AtomicBool
+	shouldAttemptCancel.Set(true)
 	hasAttemptedCancel := make(chan struct{})
 	params, _ := tests.CreateTestServerParams()
 	params.Knobs = base.TestingKnobs{
 		GCJob: &sql.GCJobTestingKnobs{
 			RunBeforeResume: func(jobID jobspb.JobID) error {
-				if !shouldAttemptCancel {
+				if !shouldAttemptCancel.Swap(false) {
 					return nil
 				}
 				_, err := db.Exec(`CANCEL JOB ($1)`, jobID)
-				require.Regexp(t, "not cancelable", err)
-				shouldAttemptCancel = false
+				assert.Regexp(t, "not cancelable", err)
 				close(hasAttemptedCancel)
 				return nil
 			},
@@ -3494,6 +3524,10 @@ INSERT INTO t.test (k, v, length) VALUES (2, 3, 1);
 
 // Test CRUD operations can read NULL values for NOT NULL columns
 // in the middle of a column backfill.
+//
+// This test in its current form is stale regarding its use of schema changes.
+// It makes low level assumptions about how the legacy schema changer works.
+// TODO(ajwerner): Rework this test for the declarative schema changer.
 func TestCRUDWhileColumnBackfill(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -3533,6 +3567,7 @@ func TestCRUDWhileColumnBackfill(t *testing.T) {
 		// Decrease the adopt loop interval so that retries happen quickly.
 		JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 	}
+
 	server, sqlDB, kvDB := serverutils.StartServer(t, params)
 	defer server.Stopper().Stop(context.Background())
 
@@ -3559,7 +3594,8 @@ INSERT INTO t.test (k, v, length) VALUES (2, 3, 1);
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
-		if _, err := sqlDB.Exec(`ALTER TABLE t.test ADD id INT8 NOT NULL DEFAULT 2, ADD u INT8 NOT NULL AS (v+1) STORED;`); err != nil {
+		if _, err := sqlDB.Exec(`SET use_declarative_schema_changer = off;
+ALTER TABLE t.test ADD id INT8 NOT NULL DEFAULT 2, ADD u INT8 NOT NULL AS (v+1) STORED;`); err != nil {
 			t.Error(err)
 		}
 		wg.Done()
@@ -3571,7 +3607,9 @@ INSERT INTO t.test (k, v, length) VALUES (2, 3, 1);
 
 	go func() {
 		// Create a column that uses the above column in an expression.
-		if _, err := sqlDB.Exec(`ALTER TABLE t.test ADD z INT8 AS (k + id) STORED;`); err != nil {
+		if _, err := sqlDB.Exec(`
+SET use_declarative_schema_changer = off;
+ALTER TABLE t.test ADD z INT8 AS (k + id) STORED;`); err != nil {
 			t.Error(err)
 		}
 		wg.Done()
@@ -3765,7 +3803,11 @@ func TestBackfillCompletesOnChunkBoundary(t *testing.T) {
 	defer tc.Stopper().Stop(context.Background())
 	kvDB := tc.Server(0).DB()
 	sqlDB := tc.ServerConn(0)
-
+	// Declarative schema changer does not use then new MVCC backfiller, so
+	// fall back for now.
+	if _, err := sqlDB.Exec("SET use_declarative_schema_changer='off'"); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := sqlDB.Exec(`
  CREATE DATABASE t;
  CREATE TABLE t.test (k INT8 PRIMARY KEY, v INT8, pi DECIMAL DEFAULT (DECIMAL '3.14'));
@@ -7730,8 +7772,10 @@ CREATE TABLE t.test (x INT);`,
 				return nil
 			}
 			params.Knobs = base.TestingKnobs{
+				SQLDeclarativeSchemaChanger: &scexec.TestingKnobs{
+					RunBeforeBackfill: waitFunc,
+				},
 				SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
-					RunBeforeBackfill:          waitFunc,
 					RunBeforeModifyRowLevelTTL: waitFunc,
 				},
 			}

@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 )
@@ -26,7 +27,11 @@ const certsDir = ".localcluster.certs"
 
 var absCertsDir string
 
-// keyLen is the length (in bits) of the generated CA and node certs.
+// keyLen is the length (in bits) of the generated TLS certs.
+//
+// This needs to be at least 2048 since the newer versions of openssl
+// (used by some tests) produce an error 'ee key too small' for
+// smaller values.
 const keyLen = 2048
 
 // AbsCertsDir returns the absolute path to the certificate directory.
@@ -52,14 +57,19 @@ func GenerateCerts(ctx context.Context) func() {
 		keyLen, 96*time.Hour, false, false))
 
 	// Root user.
+	// Scope root user to system tenant and tenant ID 5 which is what we use by default for acceptance
+	// tests.
+	userScopes := []roachpb.TenantID{roachpb.SystemTenantID, roachpb.MakeTenantID(5)}
 	maybePanic(security.CreateClientPair(
 		certsDir, filepath.Join(certsDir, security.EmbeddedCAKey),
-		2048, 48*time.Hour, false, username.RootUserName(), true /* generate pk8 key */))
+		keyLen, 48*time.Hour, false, username.RootUserName(), userScopes, true /* generate pk8 key */))
 
 	// Test user.
+	// Scope test user to system tenant and tenant ID 5 which is what we use by default for acceptance
+	// tests.
 	maybePanic(security.CreateClientPair(
 		certsDir, filepath.Join(certsDir, security.EmbeddedCAKey),
-		1024, 48*time.Hour, false, username.TestUserName(), true /* generate pk8 key */))
+		keyLen, 48*time.Hour, false, username.TestUserName(), userScopes, true /* generate pk8 key */))
 
 	// Certs for starting a cockroach server. Key size is from cli/cert.go:defaultKeySize.
 	maybePanic(security.CreateNodePair(

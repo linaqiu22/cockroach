@@ -21,6 +21,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/errors"
 )
 
@@ -91,8 +93,12 @@ func mutationStateChange(
 	return nil
 }
 
-func removeMutation(
-	tbl *tabledesc.Mutable, f MutationSelector, exp descpb.DescriptorMutation_State,
+func (m *visitor) removeMutation(
+	tbl *tabledesc.Mutable,
+	f MutationSelector,
+	metadata scpb.TargetMetadata,
+	details eventpb.CommonSQLEventDetails,
+	exp ...descpb.DescriptorMutation_State,
 ) (descpb.DescriptorMutation, error) {
 	mut, err := FindMutation(tbl, f)
 	if err != nil {
@@ -100,13 +106,43 @@ func removeMutation(
 	}
 	foundIdx := mut.MutationOrdinal()
 	cpy := tbl.Mutations[foundIdx]
-	if cpy.State != exp {
+	var foundExpState bool
+	for _, s := range exp {
+		if cpy.State == s {
+			foundExpState = true
+			break
+		}
+	}
+	if !foundExpState {
 		return descpb.DescriptorMutation{}, errors.AssertionFailedf(
 			"remove mutation from %d: unexpected state: got %v, expected %v: %v",
 			tbl.GetID(), cpy.State, exp, tbl,
 		)
 	}
 	tbl.Mutations = append(tbl.Mutations[:foundIdx], tbl.Mutations[foundIdx+1:]...)
+	// If this is the last remaining mutation, then we need to emit an event
+	// log entry.
+	hasMutationID := false
+	for _, mut := range tbl.Mutations {
+		if mut.MutationID == cpy.MutationID {
+			hasMutationID = true
+			break
+		}
+	}
+	if !hasMutationID {
+		err := m.s.EnqueueEvent(tbl.GetID(),
+			metadata,
+			details,
+			&eventpb.FinishSchemaChange{
+				CommonSchemaChangeEventDetails: eventpb.CommonSchemaChangeEventDetails{
+					DescriptorID: uint32(tbl.GetID()),
+					MutationID:   uint32(cpy.MutationID),
+				},
+			})
+		if err != nil {
+			return cpy, err
+		}
+	}
 	return cpy, nil
 }
 
@@ -163,6 +199,14 @@ func MakeColumnIDMutationSelector(columnID descpb.ColumnID) MutationSelector {
 	}
 }
 
+// MakeMutationIDMutationSelector returns a MutationSelector which matches the
+// first mutation with this ID.
+func MakeMutationIDMutationSelector(mutationID descpb.MutationID) MutationSelector {
+	return func(mut catalog.Mutation) bool {
+		return mut.MutationID() == mutationID
+	}
+}
+
 func enqueueAddColumnMutation(tbl *tabledesc.Mutable, col *descpb.ColumnDescriptor) error {
 	tbl.AddColumnMutation(col, descpb.DescriptorMutation_ADD)
 	tbl.NextMutationID--
@@ -175,8 +219,12 @@ func enqueueDropColumnMutation(tbl *tabledesc.Mutable, col *descpb.ColumnDescrip
 	return nil
 }
 
-func enqueueAddIndexMutation(tbl *tabledesc.Mutable, idx *descpb.IndexDescriptor) error {
-	if err := tbl.DeprecatedAddIndexMutation(idx, descpb.DescriptorMutation_ADD); err != nil {
+func enqueueAddIndexMutation(
+	tbl *tabledesc.Mutable, idx *descpb.IndexDescriptor, state descpb.DescriptorMutation_State,
+) error {
+	if err := tbl.AddIndexMutation(
+		idx, descpb.DescriptorMutation_ADD, state,
+	); err != nil {
 		return err
 	}
 	tbl.NextMutationID--
@@ -184,7 +232,9 @@ func enqueueAddIndexMutation(tbl *tabledesc.Mutable, idx *descpb.IndexDescriptor
 }
 
 func enqueueDropIndexMutation(tbl *tabledesc.Mutable, idx *descpb.IndexDescriptor) error {
-	if err := tbl.DeprecatedAddIndexMutation(idx, descpb.DescriptorMutation_DROP); err != nil {
+	if err := tbl.AddIndexMutation(
+		idx, descpb.DescriptorMutation_DROP, descpb.DescriptorMutation_DELETE_AND_WRITE_ONLY,
+	); err != nil {
 		return err
 	}
 	tbl.NextMutationID--

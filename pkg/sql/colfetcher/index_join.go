@@ -162,7 +162,10 @@ func (s *ColIndexJoin) Init(ctx context.Context) {
 		}
 		s.streamerInfo.Streamer.Init(
 			mode,
-			kvstreamer.Hints{UniqueRequests: true},
+			kvstreamer.Hints{
+				UniqueRequests:  true,
+				SingleRowLookup: true,
+			},
 			int(s.cf.table.spec.MaxKeysPerRow),
 			s.streamerInfo.diskBuffer,
 		)
@@ -434,7 +437,7 @@ func (s *ColIndexJoin) GetRowsRead() int64 {
 
 // GetCumulativeContentionTime is part of the colexecop.KVReader interface.
 func (s *ColIndexJoin) GetCumulativeContentionTime() time.Duration {
-	return execstats.GetCumulativeContentionTime(s.Ctx)
+	return execstats.GetCumulativeContentionTime(s.Ctx, nil /* recording */)
 }
 
 // inputBatchSizeLimit is a batch size limit for the number of input rows that
@@ -622,7 +625,7 @@ func adjustMemEstimate(estimate int64) int64 {
 
 // GetScanStats is part of the colexecop.KVReader interface.
 func (s *ColIndexJoin) GetScanStats() execstats.ScanStats {
-	return execstats.GetScanStats(s.Ctx)
+	return execstats.GetScanStats(s.Ctx, nil /* recording */)
 }
 
 // Release implements the execinfra.Releasable interface.

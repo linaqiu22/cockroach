@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/allocatorimpl"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/google/btree"
 )
@@ -64,7 +65,7 @@ func (rm *RangeMap) AddRange(minKey string) *Range {
 	rm.ranges.AscendGreaterOrEqual(r, func(i btree.Item) bool {
 		// The min key already exists in the range map, we cannot return a new
 		// range. Instead crash here as this is a bug.
-		if i.Less(r) {
+		if !r.Less(i) {
 			panic(fmt.Sprintf("Range with minKey: %s already exists within the range map, unable to add new range", r.MinKey))
 		}
 
@@ -105,30 +106,6 @@ func (rm *RangeMap) GetRange(key string) *Range {
 	return rng
 }
 
-// ReplicaLoad is the sum of all key accesses and size of bytes, both written
-// and read.
-// TODO(kvoli): In the non-simulated code, replica_stats currently maintains
-// this structure, which is rated. This datastructure needs to be adapated by
-// the user to be rated over time. In the future we should introduce a better
-// general pupose stucture that enables rating.
-type ReplicaLoad struct {
-	WriteKeys  int64
-	WriteBytes int64
-	ReadKeys   int64
-	ReadBytes  int64
-}
-
-// applyReplicaLoad applies a load event onto a replica.
-func (r *Replica) applyReplicaLoad(le LoadEvent) {
-	if le.isWrite {
-		r.ReplicaLoad.WriteBytes += le.size
-		r.ReplicaLoad.WriteKeys++
-	} else {
-		r.ReplicaLoad.ReadBytes += le.size
-		r.ReplicaLoad.ReadKeys++
-	}
-}
-
 // Replica represents a replica of a range.
 type Replica struct {
 	spanConf    *roachpb.SpanConfig
@@ -142,6 +119,7 @@ type Replica struct {
 type Store struct {
 	Replicas  map[int]*Replica
 	allocator allocatorimpl.Allocator
+	pacer     ReplicaPacer
 }
 
 // Node represents a node within the cluster.
@@ -186,12 +164,28 @@ func (s *State) AddNode() (nodeID int) {
 	return nodeID
 }
 
+// nodeCountFn returns the total number of active nodes within the simulator.
+// TODO(kvoli,lidorcarmel): Update this function to account for cluster
+// membership.
+func (s *State) nodeCountFn() int {
+	return len(s.Nodes)
+}
+
+// nodeLivenessFn returns the liveness of the node associated with nodeID.
+// TODO(kvoli,lidorcarmel): Update this function to consider simulated
+// liveness.
+func (s *State) nodeLivenessFn(
+	nid roachpb.NodeID, now time.Time, timeUntilStoreDead time.Duration,
+) livenesspb.NodeLivenessStatus {
+	return livenesspb.NodeLivenessStatus_LIVE
+}
+
 // AddStore adds a store to an existing node.
 // TODO(lidorcarmel,kvoli): Add storeID parameter to support multi-store
 // configurations.
 func (s *State) AddStore(node int) {
 	allocator := allocatorimpl.MakeAllocator(
-		nil,
+		NewStorePool(s.nodeCountFn, s.nodeLivenessFn),
 		func(string) (time.Duration, bool) {
 			return 0, true
 		},
@@ -201,6 +195,21 @@ func (s *State) AddStore(node int) {
 		allocator: allocator,
 		Replicas:  make(map[int]*Replica),
 	}
+	nextReplsFn := func() []*Replica {
+		repls := make([]*Replica, 0, 1)
+		for _, repl := range store.Replicas {
+			repls = append(repls, repl)
+		}
+		return repls
+	}
+
+	store.pacer = NewScannerReplicaPacer(
+		nextReplsFn,
+		defaultLoopInterval,
+		defaultMinInterInterval,
+		defaultMaxIterInterval,
+	)
+
 	s.Nodes[node].Stores = append(s.Nodes[node].Stores, store)
 }
 
@@ -221,7 +230,7 @@ func (s *State) AddReplica(r *Range, node int) int {
 		spanConf:    &roachpb.SpanConfig{},
 		rangeDesc:   r.Desc,
 		replDesc:    &desc,
-		ReplicaLoad: ReplicaLoad{},
+		ReplicaLoad: &ReplicaLoadCounter{},
 	}
 
 	store := nodeImpl.Stores[0]
@@ -247,36 +256,34 @@ func (s *State) AddReplica(r *Range, node int) int {
 	return int(desc.ReplicaID)
 }
 
-// StoreLoad represents the current load of the store.
-type StoreLoad struct {
-	WriteKeys  int64
-	WriteBytes int64
-	ReadKeys   int64
-	ReadBytes  int64
-	RangeCount int64
-	LeaseCount int64
+func (s *State) storeDescriptors() []roachpb.StoreDescriptor {
+	storeDescriptors := make([]roachpb.StoreDescriptor, 0, 1)
+	// TODO(kvoli): storeID needs to be consistent.
+	for i, node := range s.Nodes {
+		for _, store := range node.Stores {
+			storeDesc := roachpb.StoreDescriptor{
+				StoreID:  roachpb.StoreID(i),
+				Node:     *node.nodeDesc,
+				Capacity: store.Capacity(),
+			}
+			storeDescriptors = append(storeDescriptors, storeDesc)
+		}
+	}
+	return storeDescriptors
 }
 
-// GetStoreLoad returns the current store load. The values in Write(Read)
-// Bytes(Keys) represent the aggregation across all leaseholder replicas on
-// this store. These values are not rated, instead they are counters.
-// TODO(kvoli): We should separate out recording of workload against
-// replicas and stores into a separate file. The internal capture datastructure
-// is less important. Then define an interface that transforms the recorded
-// load into store descriptors and range usage info.
-func (s *Store) GetStoreLoad() StoreLoad {
-	storeLoad := StoreLoad{}
-	for _, repl := range s.Replicas {
-		if repl.leaseHolder {
-			storeLoad.LeaseCount++
+// updateStorePools puts the current tick store descriptors into the state
+// exchange. It then updates the exchanged descriptors for each store's store
+// pool.
+func (s *Simulator) updateStorePools(tick time.Time) {
+	storeDescriptors := s.state.storeDescriptors()
+	s.exchange.Put(tick, storeDescriptors...)
+	for i, node := range s.state.Nodes {
+		for _, store := range node.Stores {
+			sp := store.allocator.StorePool
+			sp.DetailsMu.StoreDetails = s.exchange.Get(tick, roachpb.StoreID(i))
 		}
-		storeLoad.RangeCount++
-		storeLoad.ReadKeys += repl.ReplicaLoad.ReadKeys
-		storeLoad.WriteKeys += repl.ReplicaLoad.WriteKeys
-		storeLoad.WriteBytes += repl.ReplicaLoad.WriteBytes
-		storeLoad.ReadBytes += repl.ReplicaLoad.ReadBytes
 	}
-	return storeLoad
 }
 
 // ApplyAllocatorAction updates the state with allocator ops such as
@@ -292,18 +299,12 @@ func (s *State) ApplyAllocatorAction(
 // written and therefore reads never fail.
 func (s *State) ApplyLoad(ctx context.Context, le LoadEvent) {
 	r := s.Ranges.GetRange(fmt.Sprintf("%d", le.Key))
-
-	// Apply the load event to the leaseholder replica of the range this key is contained in.
-	//
-	//NB: Reads may occur in practice across follower replicas, however these
+	// NB: Reads may occur in practice across follower replicas, however these
 	// statistics are not currently considered in allocation decisions.
 	// Initially we ignore workload on followers.
 	// TODO(kvoli): Apply write/read load to followers.
-	r.Leaseholder.applyReplicaLoad(le)
-}
-
-func shouldRun(time.Time) bool {
-	return false
+	leaseHolder := r.Leaseholder
+	leaseHolder.ReplicaLoad.ApplyLoad(le)
 }
 
 // RunAllocator runs the allocator code for some replicas as needed.
@@ -313,16 +314,9 @@ func RunAllocator(
 	spanConf roachpb.SpanConfig,
 	desc *roachpb.RangeDescriptor,
 	tick time.Time,
-) (done bool, action allocatorimpl.AllocatorAction, priority float64) {
-	// TODO: we should pace the calls to ComputeAction. The replicate queue tries
-	// to call ComputeAction for all replicas at a steady pace, to complete a pass
-	// within 10 minutes. We should have similar logic here (using simulated
-	// time).
-	if !shouldRun(tick) {
-		return true, allocatorimpl.AllocatorNoop, 0
-	}
+) (action allocatorimpl.AllocatorAction, priority float64) {
 	action, priority = allocator.ComputeAction(ctx, spanConf, desc)
-	return false, action, priority
+	return action, priority
 }
 
 // Simulator simulates an entire cluster, and runs the allocators of each store
@@ -334,12 +328,18 @@ type Simulator struct {
 
 	// The simulator can run multiple workload Generators in parallel.
 	generators []WorkloadGenerator
-	state      *State
+
+	state    *State
+	exchange StateExchange
 }
 
 // NewSimulator constructs a valid Simulator.
 func NewSimulator(
-	start, end time.Time, interval time.Duration, wgs []WorkloadGenerator, initialState *State,
+	start, end time.Time,
+	interval time.Duration,
+	wgs []WorkloadGenerator,
+	initialState *State,
+	exchange StateExchange,
 ) *Simulator {
 	return &Simulator{
 		curr:       start,
@@ -347,6 +347,7 @@ func NewSimulator(
 		interval:   interval,
 		generators: wgs,
 		state:      initialState,
+		exchange:   exchange,
 	}
 }
 
@@ -390,18 +391,31 @@ func (s *Simulator) RunSim(ctx context.Context) {
 			}
 		}
 
-		// Done with config and load updates, the state is ready for the allocators.
+		// Update each allocators view of the stores in the cluster.
+		s.updateStorePools(tick)
+
+		// Done with config and load updates, the state is ready for the
+		// allocators.
 		stateForAlloc := s.state
 
 		for _, node := range stateForAlloc.Nodes {
 			for _, store := range node.Stores {
-				for _, r := range store.Replicas {
-					// Run the real allocator code. Note that the input is from the
-					// "frozen" state which is not affected by rebalancing decisions.
-					done, action, priority := RunAllocator(ctx, store.allocator, *r.spanConf, r.rangeDesc, tick)
-					if done {
+				for {
+					r := store.pacer.Next(tick)
+					// No replicas to consider at this tick.
+					if r == nil {
 						break
 					}
+
+					// NB: Only the leaseholder replica for the range is
+					// considered in the allocator.
+					if !r.leaseHolder {
+						continue
+					}
+
+					// Run the real allocator code. Note that the input is from the
+					// "frozen" state which is not affected by rebalancing decisions.
+					action, priority := RunAllocator(ctx, store.allocator, *r.spanConf, r.rangeDesc, tick)
 
 					// The allocator ops are applied.
 					s.state.ApplyAllocatorAction(ctx, action, priority)

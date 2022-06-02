@@ -14,6 +14,7 @@ import (
 	"context"
 	"math"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"time"
@@ -39,8 +40,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/scheduledjobs"
+	"github.com/cockroachdb/cockroach/pkg/security/clientsecopts"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/diagnostics"
+	"github.com/cockroachdb/cockroach/pkg/server/pgurl"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/settingswatcher"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
@@ -76,7 +79,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rangeprober"
 	"github.com/cockroachdb/cockroach/pkg/sql/scheduledlogging"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scdeps"
-	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scrun"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
@@ -353,7 +356,9 @@ func newRootSQLMemoryMonitor(opts monitorAndMetricsOptions) monitorAndMetrics {
 	// this monitor will be setting their own noteworthy limits.
 	rootSQLMemoryMonitor := mon.NewMonitor(
 		"root",
-		mon.MemoryResource,
+		mon.NewMemoryResourceWithErrorHint(
+			"Consider increasing --max-sql-memory startup parameter.", /* hint */
+		),
 		rootSQLMetrics.CurBytesCount,
 		rootSQLMetrics.MaxBytesHist,
 		-1,            /* increment: use default increment */
@@ -592,6 +597,8 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 
 	clusterIDForSQL := cfg.rpcContext.LogicalClusterID
 
+	bulkSenderLimiter := bulk.MakeAndRegisterConcurrencyLimiter(&cfg.Settings.SV)
+
 	// Set up the DistSQL server.
 	distSQLCfg := execinfra.ServerConfig{
 		AmbientContext:   cfg.AmbientCtx,
@@ -618,6 +625,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		ParentDiskMonitor: cfg.TempStorageConfig.Mon,
 		BackfillerMonitor: backfillMemoryMonitor,
 		BackupMonitor:     backupMemoryMonitor,
+		BulkSenderLimiter: bulkSenderLimiter,
 
 		ParentMemoryMonitor: rootSQLMemoryMonitor,
 		BulkAdder: func(
@@ -626,7 +634,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 			// Attach a child memory monitor to enable control over the BulkAdder's
 			// memory usage.
 			bulkMon := execinfra.NewMonitor(ctx, bulkMemoryMonitor, "bulk-adder-monitor")
-			return bulk.MakeBulkAdder(ctx, db, cfg.distSender.RangeDescriptorCache(), cfg.Settings, ts, opts, bulkMon)
+			return bulk.MakeBulkAdder(ctx, db, cfg.distSender.RangeDescriptorCache(), cfg.Settings, ts, opts, bulkMon, bulkSenderLimiter)
 		},
 
 		Metrics:            &distSQLMetrics,
@@ -647,6 +655,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		RangeCache:               cfg.distSender.RangeDescriptorCache(),
 		SQLSQLResponseAdmissionQ: cfg.sqlSQLResponseAdmissionQ,
 		CollectionFactory:        collectionFactory,
+		ExternalIORecorder:       cfg.costController,
 	}
 	cfg.TempStorageConfig.Mon.SetMetrics(distSQLMetrics.CurDiskBytesCount, distSQLMetrics.MaxDiskBytesHist)
 	if distSQLTestingKnobs := cfg.TestingKnobs.DistSQL; distSQLTestingKnobs != nil {
@@ -668,9 +677,21 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		sqlExecutorTestingKnobs = sql.ExecutorTestingKnobs{}
 	}
 
+	ccopts := clientsecopts.ClientSecurityOptions{
+		Insecure: cfg.Config.Insecure,
+		CertsDir: cfg.Config.SSLCertsDir,
+	}
+	sparams := clientsecopts.ServerParameters{
+		ServerAddr:      cfg.Config.SQLAdvertiseAddr,
+		DefaultPort:     base.DefaultPort,
+		DefaultDatabase: catalogkeys.DefaultDatabaseName,
+	}
+
 	nodeInfo := sql.NodeInfo{
-		AdminURL:         cfg.AdminURL,
-		PGURL:            cfg.rpcContext.PGURL,
+		AdminURL: cfg.AdminURL,
+		PGURL: func(user *url.Userinfo) (*pgurl.URL, error) {
+			return clientsecopts.MakeURLForServer(ccopts, sparams, user)
+		},
 		LogicalClusterID: cfg.rpcContext.LogicalClusterID.Get,
 		NodeID:           cfg.nodeIDContainer,
 	}
@@ -798,9 +819,9 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		execCfg.SchemaChangerTestingKnobs = new(sql.SchemaChangerTestingKnobs)
 	}
 	if declarativeSchemaChangerTestingKnobs := cfg.TestingKnobs.SQLDeclarativeSchemaChanger; declarativeSchemaChangerTestingKnobs != nil {
-		execCfg.DeclarativeSchemaChangerTestingKnobs = declarativeSchemaChangerTestingKnobs.(*scrun.TestingKnobs)
+		execCfg.DeclarativeSchemaChangerTestingKnobs = declarativeSchemaChangerTestingKnobs.(*scexec.TestingKnobs)
 	} else {
-		execCfg.DeclarativeSchemaChangerTestingKnobs = new(scrun.TestingKnobs)
+		execCfg.DeclarativeSchemaChangerTestingKnobs = new(scexec.TestingKnobs)
 	}
 	if sqlTypeSchemaChangerTestingKnobs := cfg.TestingKnobs.SQLTypeSchemaChanger; sqlTypeSchemaChangerTestingKnobs != nil {
 		execCfg.TypeSchemaChangerTestingKnobs = sqlTypeSchemaChangerTestingKnobs.(*sql.TypeSchemaChangerTestingKnobs)
@@ -900,6 +921,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 	distSQLServer.ServerConfig.SessionBoundInternalExecutorFactory = ieFactory
 	jobRegistry.SetSessionBoundInternalExecutorFactory(ieFactory)
 	execCfg.IndexBackfiller = sql.NewIndexBackfiller(execCfg)
+	execCfg.IndexMerger = sql.NewIndexBackfillerMergePlanner(execCfg)
 	execCfg.IndexValidator = scdeps.NewIndexValidator(
 		execCfg.DB,
 		execCfg.Codec,

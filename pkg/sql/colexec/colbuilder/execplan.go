@@ -943,7 +943,7 @@ func NewColOperator(
 							newAggArgs.Allocator = colmem.NewAllocator(ctx, ehaMemAccount, factory)
 							newAggArgs.MemAccount = ehaMemAccount
 							newAggArgs.Input = input
-							return colexecdisk.NewExternalHashAggregator(
+							eha, toClose := colexecdisk.NewExternalHashAggregator(
 								flowCtx,
 								args,
 								&newAggArgs,
@@ -957,6 +957,8 @@ func NewColOperator(
 								outputUnlimitedAllocator,
 								maxOutputBatchMemSize,
 							)
+							result.ToClose = append(result.ToClose, toClose)
+							return eha
 						},
 						args.TestingKnobs.SpillingCallbackFn,
 					)
@@ -1006,7 +1008,7 @@ func NewColOperator(
 						unlimitedAllocator := colmem.NewAllocator(
 							ctx, args.MonitorRegistry.CreateUnlimitedMemAccount(ctx, flowCtx, edOpName, spec.ProcessorID), factory,
 						)
-						return colexecdisk.NewExternalDistinct(
+						ed, toClose := colexecdisk.NewExternalDistinct(
 							unlimitedAllocator,
 							flowCtx,
 							args,
@@ -1016,6 +1018,8 @@ func NewColOperator(
 							inMemoryUnorderedDistinct,
 							diskAccount,
 						)
+						result.ToClose = append(result.ToClose, toClose)
+						return ed
 					},
 					args.TestingKnobs.SpillingCallbackFn,
 				)
@@ -1106,7 +1110,7 @@ func NewColOperator(
 								result.makeDiskBackedSorterConstructor(ctx, flowCtx, args, opName, factory),
 								diskAccount,
 							)
-							result.ToClose = append(result.ToClose, ehj.(colexecop.Closer))
+							result.ToClose = append(result.ToClose, ehj)
 							return ehj
 						},
 						args.TestingKnobs.SpillingCallbackFn,
@@ -1202,36 +1206,40 @@ func NewColOperator(
 				// We allocate the capacity for two extra types because of the temporary
 				// columns that can be appended below. Capacity is also allocated for
 				// each of the argument types in case casting is necessary.
-				typs := make([]*types.T, len(result.ColumnTypes), len(result.ColumnTypes)+len(wf.ArgsIdxs)+2)
+				numInputCols := len(result.ColumnTypes)
+				typs := make([]*types.T, numInputCols, numInputCols+len(wf.ArgsIdxs)+2)
 				copy(typs, result.ColumnTypes)
 
 				// Set any nil values in the window frame to their default values.
 				wf.Frame = colexecwindow.NormalizeWindowFrame(wf.Frame)
 
-				tempColOffset := uint32(0)
-				argTypes := make([]*types.T, len(wf.ArgsIdxs))
+				// Copy the argument indices into a mutable slice.
 				argIdxs := make([]int, len(wf.ArgsIdxs))
+				argTypes := make([]*types.T, len(wf.ArgsIdxs))
 				for i, idx := range wf.ArgsIdxs {
-					// Retrieve the type of each argument and perform any necessary casting.
-					needsCast, expectedType := colexecwindow.WindowFnArgNeedsCast(wf.Func, typs[idx], i)
-					if needsCast {
-						// We must cast to the expected argument type.
-						castIdx := len(typs)
-						input, err = colexecbase.GetCastOperator(
-							getStreamingAllocator(ctx, args), input, int(idx),
-							castIdx, typs[idx], expectedType, flowCtx.EvalCtx,
-						)
-						if err != nil {
-							colexecerror.InternalError(errors.AssertionFailedf(
-								"failed to cast window function argument to type %v", expectedType))
-						}
-						typs = append(typs, expectedType)
-						idx = uint32(castIdx)
-						tempColOffset++
-					}
-					argTypes[i] = expectedType
 					argIdxs[i] = int(idx)
+					argTypes[i] = typs[idx]
 				}
+
+				// Perform any necessary casts for the argument columns.
+				castTo := colexecwindow.WindowFnArgCasts(wf.Func, argTypes)
+				for i, typ := range castTo {
+					if typ == nil {
+						continue
+					}
+					castIdx := len(typs)
+					input, err = colexecbase.GetCastOperator(
+						getStreamingAllocator(ctx, args), input, argIdxs[i],
+						castIdx, argTypes[i], typ, flowCtx.EvalCtx,
+					)
+					if err != nil {
+						colexecerror.InternalError(err)
+					}
+					typs = append(typs, typ)
+					argIdxs[i] = castIdx
+					argTypes[i] = typ
+				}
+
 				partitionColIdx := tree.NoColumnIdx
 				peersColIdx := tree.NoColumnIdx
 
@@ -1240,7 +1248,7 @@ func NewColOperator(
 					// (probably by leveraging hash routers once we can
 					// distribute). The decision about which kind of partitioner
 					// to use should come from the optimizer.
-					partitionColIdx = int(wf.OutputColIdx + tempColOffset)
+					partitionColIdx = len(typs)
 					input = colexecwindow.NewWindowSortingPartitioner(
 						getStreamingAllocator(ctx, args), input, typs,
 						core.Windower.PartitionBy, wf.Ordering.Columns, partitionColIdx,
@@ -1253,9 +1261,7 @@ func NewColOperator(
 						},
 					)
 					// Window partitioner will append a boolean column.
-					tempColOffset++
-					typs = typs[:len(typs)+1]
-					typs[len(typs)-1] = types.Bool
+					typs = append(typs, types.Bool)
 				} else {
 					if len(wf.Ordering.Columns) > 0 {
 						input = result.createDiskBackedSort(
@@ -1266,17 +1272,17 @@ func NewColOperator(
 					}
 				}
 				if colexecwindow.WindowFnNeedsPeersInfo(&wf) {
-					peersColIdx = int(wf.OutputColIdx + tempColOffset)
+					peersColIdx = len(typs)
 					input = colexecwindow.NewWindowPeerGrouper(
 						getStreamingAllocator(ctx, args), input, typs,
 						wf.Ordering.Columns, partitionColIdx, peersColIdx,
 					)
 					// Window peer grouper will append a boolean column.
-					tempColOffset++
-					typs = typs[:len(typs)+1]
-					typs[len(typs)-1] = types.Bool
+					typs = append(typs, types.Bool)
 				}
-				outputIdx := int(wf.OutputColIdx + tempColOffset)
+
+				// The output column is appended after any temporary columns.
+				outputColIdx := len(typs)
 
 				windowArgs := &colexecwindow.WindowArgs{
 					EvalCtx:         flowCtx.EvalCtx,
@@ -1285,7 +1291,7 @@ func NewColOperator(
 					FdSemaphore:     args.FDSemaphore,
 					Input:           input,
 					InputTypes:      typs,
-					OutputColIdx:    outputIdx,
+					OutputColIdx:    outputColIdx,
 					PartitionColIdx: partitionColIdx,
 					PeersColIdx:     peersColIdx,
 				}
@@ -1419,7 +1425,9 @@ func NewColOperator(
 						}
 						result.Root = colexecwindow.NewWindowAggregatorOperator(
 							windowArgs, aggType, wf.Frame, &wf.Ordering, argIdxs,
-							aggArgs.OutputTypes[0], aggFnsAlloc, toClose)
+							aggArgs.OutputTypes[0], aggFnsAlloc,
+						)
+						result.ToClose = append(result.ToClose, toClose...)
 						returnType = aggArgs.OutputTypes[0]
 					}
 				} else {
@@ -1429,16 +1437,17 @@ func NewColOperator(
 					result.ToClose = append(result.ToClose, c)
 				}
 
-				if tempColOffset > 0 {
-					// We want to project out temporary columns (which have
-					// indices in the range [wf.OutputColIdx,
-					// wf.OutputColIdx+tempColOffset)).
-					projection := make([]uint32, 0, wf.OutputColIdx+tempColOffset)
-					for i := uint32(0); i < wf.OutputColIdx; i++ {
-						projection = append(projection, i)
+				if outputColIdx > numInputCols {
+					// We want to project out temporary columns (which have been added in
+					// between the input columns and output column) as well as include the
+					// new output column (which is located after any temporary columns).
+					numOutputCols := numInputCols + 1
+					projection := make([]uint32, numOutputCols)
+					for i := 0; i < numInputCols; i++ {
+						projection[i] = uint32(i)
 					}
-					projection = append(projection, wf.OutputColIdx+tempColOffset)
-					result.Root = colexecbase.NewSimpleProjectOp(result.Root, int(wf.OutputColIdx+tempColOffset), projection)
+					projection[numInputCols] = uint32(outputColIdx)
+					result.Root = colexecbase.NewSimpleProjectOp(result.Root, numOutputCols, projection)
 				}
 
 				result.ColumnTypes = appendOneType(result.ColumnTypes, returnType)

@@ -68,6 +68,7 @@ func (n *newSchemaChangeResumer) run(ctx context.Context, execCtxI interface{}) 
 		execCfg.DB,
 		execCfg.InternalExecutor,
 		execCfg.IndexBackfiller,
+		execCfg.IndexMerger,
 		NewRangeCounter(execCfg.DB, execCfg.DistSQLPlanner),
 		func(txn *kv.Txn) scexec.EventLogger {
 			return sql.NewSchemaChangerEventLogger(txn, execCfg, 0)
@@ -78,13 +79,14 @@ func (n *newSchemaChangeResumer) run(ctx context.Context, execCtxI interface{}) 
 		execCfg.Settings,
 		execCfg.IndexValidator,
 		execCfg.DescMetadaUpdaterFactory,
+		execCfg.StatsRefresher,
 		execCfg.DeclarativeSchemaChangerTestingKnobs,
 		payload.Statement,
 		execCtx.SessionData(),
 		execCtx.ExtendedEvalContext().Tracing.KVTracingEnabled(),
 	)
 
-	return scrun.RunSchemaChangesInJob(
+	err := scrun.RunSchemaChangesInJob(
 		ctx,
 		execCfg.DeclarativeSchemaChangerTestingKnobs,
 		execCfg.Settings,
@@ -93,4 +95,12 @@ func (n *newSchemaChangeResumer) run(ctx context.Context, execCtxI interface{}) 
 		payload.DescriptorIDs,
 		n.rollback,
 	)
+	// Return permanent errors back, otherwise we will try to retry
+	if sql.IsPermanentSchemaChangeError(err) {
+		return err
+	}
+	if err != nil {
+		return jobs.MarkAsRetryJobError(err)
+	}
+	return nil
 }

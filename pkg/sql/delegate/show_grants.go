@@ -187,7 +187,7 @@ FROM "".information_schema.type_privileges`
 			// if the type of target is table.
 			var allTables tree.TableNames
 
-			for _, tableTarget := range n.Targets.Tables {
+			for _, tableTarget := range n.Targets.Tables.TablePatterns {
 				tableGlob, err := tableTarget.NormalizeTablePattern()
 				if err != nil {
 					return nil, err
@@ -221,20 +221,20 @@ FROM "".information_schema.type_privileges`
 		} else {
 			// No target: only look at types, tables and schemas in the current database.
 			source.WriteString(
-				`SELECT database_name, schema_name, table_name AS relation_name, grantee, privilege_type FROM (`,
+				`SELECT database_name, schema_name, table_name AS relation_name, grantee, privilege_type, is_grantable FROM (`,
 			)
 			source.WriteString(tablePrivQuery)
 			source.WriteByte(')')
 			source.WriteString(` UNION ALL ` +
-				`SELECT database_name, schema_name, NULL::STRING AS relation_name, grantee, privilege_type FROM (`)
+				`SELECT database_name, schema_name, NULL::STRING AS relation_name, grantee, privilege_type, is_grantable FROM (`)
 			source.WriteString(schemaPrivQuery)
 			source.WriteByte(')')
 			source.WriteString(` UNION ALL ` +
-				`SELECT database_name, NULL::STRING AS schema_name, NULL::STRING AS relation_name, grantee, privilege_type FROM (`)
+				`SELECT database_name, NULL::STRING AS schema_name, NULL::STRING AS relation_name, grantee, privilege_type, is_grantable FROM (`)
 			source.WriteString(dbPrivQuery)
 			source.WriteByte(')')
 			source.WriteString(` UNION ALL ` +
-				`SELECT database_name, schema_name, type_name AS relation_name, grantee, privilege_type FROM (`)
+				`SELECT database_name, schema_name, type_name AS relation_name, grantee, privilege_type, is_grantable FROM (`)
 			source.WriteString(typePrivQuery)
 			source.WriteByte(')')
 			// If the current database is set, restrict the command to it.

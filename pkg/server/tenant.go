@@ -345,7 +345,6 @@ func startTenantInternal(
 	}
 
 	nextLiveInstanceIDFn := makeNextLiveInstanceIDFn(s.sqlInstanceProvider, s.SQLInstanceID())
-
 	if err := args.costController.Start(
 		ctx, args.stopper, s.SQLInstanceID(), s.sqlLivenessSessionID,
 		externalUsageFn, nextLiveInstanceIDFn,
@@ -385,7 +384,7 @@ func makeTenantSQLServerArgs(
 	// https://github.com/cockroachdb/cockroach/issues/47898
 	baseCfg.ClusterName = kvClusterName
 
-	clock := hlc.NewClock(hlc.UnixNano, time.Duration(baseCfg.MaxOffset))
+	clock := hlc.NewClockWithSystemTimeSource(time.Duration(baseCfg.MaxOffset))
 
 	registry := metric.NewRegistry()
 
@@ -522,6 +521,7 @@ func makeTenantSQLServerArgs(
 		baseCfg.TestingKnobs,
 		circularInternalExecutor,
 		db,
+		costController,
 	)
 
 	grpcServer := newGRPCServer(rpcContext)
@@ -648,4 +648,19 @@ func (noopTenantSideCostController) OnRequestWait(
 func (noopTenantSideCostController) OnResponse(
 	ctx context.Context, req tenantcostmodel.RequestInfo, resp tenantcostmodel.ResponseInfo,
 ) {
+}
+
+func (noopTenantSideCostController) ExternalIOWriteWait(ctx context.Context, req int64) error {
+	return nil
+}
+
+func (noopTenantSideCostController) ExternalIOWriteSuccess(ctx context.Context, req int64) {
+}
+func (noopTenantSideCostController) ExternalIOWriteFailure(
+	ctx context.Context, used int64, unused int64,
+) {
+}
+
+func (noopTenantSideCostController) ExternalIOReadWait(ctx context.Context, req int64) error {
+	return nil
 }

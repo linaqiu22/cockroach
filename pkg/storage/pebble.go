@@ -59,7 +59,7 @@ import (
 const maxSyncDurationFatalOnExceededDefault = true
 
 // Default for MaxSyncDuration below.
-var maxSyncDurationDefault = envutil.EnvOrDefaultDuration("COCKROACH_ENGINE_MAX_SYNC_DURATION_DEFAULT", 60*time.Second)
+var maxSyncDurationDefault = envutil.EnvOrDefaultDuration("COCKROACH_ENGINE_MAX_SYNC_DURATION_DEFAULT", 20*time.Second)
 
 // MaxSyncDuration is the threshold above which an observed engine sync duration
 // triggers either a warning or a fatal error.
@@ -579,6 +579,7 @@ func DefaultPebbleOptions() *pebble.Options {
 
 	opts := &pebble.Options{
 		Comparer:                    EngineComparer,
+		FS:                          vfs.Default,
 		L0CompactionThreshold:       2,
 		L0StopWritesThreshold:       1000,
 		LBaseMaxBytes:               64 << 20, // 64 MB
@@ -624,19 +625,15 @@ func DefaultPebbleOptions() *pebble.Options {
 		l.EnsureDefaults()
 	}
 
-	// Do not create bloom filters for the last level (i.e. the largest level
-	// which contains data in the LSM store). This configuration reduces the size
-	// of the bloom filters by 10x. This is significant given that bloom filters
-	// require 1.25 bytes (10 bits) per key which can translate into gigabytes of
-	// memory given typical key and value sizes. The downside is that bloom
-	// filters will only be usable on the higher levels, but that seems
-	// acceptable. We typically see read amplification of 5-6x on clusters
-	// (i.e. there are 5-6 levels of sstables) which means we'll achieve 80-90%
-	// of the benefit of having bloom filters on every level for only 10% of the
-	// memory cost.
-	opts.Levels[6].FilterPolicy = nil
+	return opts
+}
 
-	// Set disk health check interval to min(5s, maxSyncDurationDefault). This
+// wrapFilesystemMiddleware wraps the Option's vfs.FS with disk-health checking
+// and ENOSPC detection. It mutates the provided options to set the FS and
+// returns a Closer that should be invoked when the filesystem will no longer be
+// used.
+func wrapFilesystemMiddleware(opts *pebble.Options) io.Closer {
+	// Set disk-health check interval to min(5s, maxSyncDurationDefault). This
 	// is mostly to ease testing; the default of 5s is too infrequent to test
 	// conveniently. See the disk-stalled roachtest for an example of how this
 	// is used.
@@ -644,9 +641,11 @@ func DefaultPebbleOptions() *pebble.Options {
 	if diskHealthCheckInterval.Seconds() > maxSyncDurationDefault.Seconds() {
 		diskHealthCheckInterval = maxSyncDurationDefault
 	}
-	// Instantiate a file system with disk health checking enabled. This FS wraps
-	// vfs.Default, and can be wrapped for encryption-at-rest.
-	opts.FS = vfs.WithDiskHealthChecks(vfs.Default, diskHealthCheckInterval,
+	// Instantiate a file system with disk health checking enabled. This FS
+	// wraps the filesystem with a layer that times all write-oriented
+	// operations.
+	var closer io.Closer
+	opts.FS, closer = vfs.WithDiskHealthChecks(opts.FS, diskHealthCheckInterval,
 		func(name string, duration time.Duration) {
 			opts.EventListener.DiskSlow(pebble.DiskSlowInfo{
 				Path:     name,
@@ -657,7 +656,7 @@ func DefaultPebbleOptions() *pebble.Options {
 	opts.FS = vfs.OnDiskFull(opts.FS, func() {
 		exit.WithCode(exit.DiskFull())
 	})
-	return opts
+	return closer
 }
 
 type pebbleLogger struct {
@@ -682,6 +681,9 @@ type PebbleConfig struct {
 	base.StorageConfig
 	// Pebble specific options.
 	Opts *pebble.Options
+	// Temporary option while there exist file descriptor leaks. See the
+	// DisableFilesystemMiddlewareTODO ConfigOption that sets this, and #81389.
+	DisableFilesystemMiddlewareTODO bool
 }
 
 // EncryptionStatsHandler provides encryption related stats.
@@ -733,6 +735,9 @@ type Pebble struct {
 		syncutil.Mutex
 		flushCompletedCallback func()
 	}
+	// closer is populated when the database is opened. The closer is associated
+	// with the filesyetem
+	closer io.Closer
 
 	wrappedIntentWriter intentDemuxWriter
 
@@ -825,13 +830,26 @@ func ResolveEncryptedEnvOptions(cfg *PebbleConfig) (*PebbleFileRegistry, *Encryp
 }
 
 // NewPebble creates a new Pebble instance, at the specified path.
-func NewPebble(ctx context.Context, cfg PebbleConfig) (*Pebble, error) {
+func NewPebble(ctx context.Context, cfg PebbleConfig) (p *Pebble, err error) {
 	// pebble.Open also calls EnsureDefaults, but only after doing a clone. Call
 	// EnsureDefaults beforehand so we have a matching cfg here for when we save
 	// cfg.FS and cfg.ReadOnly later on.
 	if cfg.Opts == nil {
 		cfg.Opts = DefaultPebbleOptions()
 	}
+
+	// Initialize the FS, wrapping it with disk health-checking and
+	// ENOSPC-detection.
+	var filesystemCloser io.Closer
+	if !cfg.DisableFilesystemMiddlewareTODO {
+		filesystemCloser = wrapFilesystemMiddleware(cfg.Opts)
+		defer func() {
+			if err != nil {
+				filesystemCloser.Close()
+			}
+		}()
+	}
+
 	cfg.Opts.EnsureDefaults()
 	cfg.Opts.ErrorIfNotExists = cfg.MustExist
 	if settings := cfg.Settings; settings != nil {
@@ -853,8 +871,6 @@ func NewPebble(ctx context.Context, cfg PebbleConfig) (*Pebble, error) {
 	// FS for those that need it. Some call sites need the unencrypted
 	// FS for the purpose of atomic renames.
 	unencryptedFS := cfg.Opts.FS
-	// TODO(jackson): Assert that unencryptedFS provides atomic renames.
-
 	fileRegistry, env, err := ResolveEncryptedEnvOptions(&cfg)
 	if err != nil {
 		return nil, err
@@ -899,7 +915,7 @@ func NewPebble(ctx context.Context, cfg PebbleConfig) (*Pebble, error) {
 
 	storeProps := computeStoreProperties(ctx, cfg.Dir, cfg.Opts.ReadOnly, env != nil /* encryptionEnabled */)
 
-	p := &Pebble{
+	p = &Pebble{
 		readOnly:         cfg.Opts.ReadOnly,
 		path:             cfg.Dir,
 		auxDir:           auxDir,
@@ -915,6 +931,7 @@ func NewPebble(ctx context.Context, cfg PebbleConfig) (*Pebble, error) {
 		unencryptedFS:    unencryptedFS,
 		logger:           cfg.Opts.Logger,
 		storeIDPebbleLog: storeIDContainer,
+		closer:           filesystemCloser,
 	}
 	cfg.Opts.EventListener = pebble.TeeEventListener(
 		pebble.MakeLoggingEventListener(pebbleLogger{
@@ -1029,6 +1046,9 @@ func (p *Pebble) Close() {
 	}
 	if p.encryption != nil {
 		_ = p.encryption.Closer.Close()
+	}
+	if p.closer != nil {
+		_ = p.closer.Close()
 	}
 }
 
@@ -1972,15 +1992,6 @@ func (p *pebbleReadOnly) NewMVCCIterator(iterKind MVCCIterKind, opts IterOptions
 		return iter
 	}
 
-	if !opts.MinTimestampHint.IsEmpty() {
-		// MVCCIterators that specify timestamp bounds cannot be cached.
-		iter := MVCCIterator(newPebbleIterator(p.parent.db, nil, opts, p.durability))
-		if util.RaceEnabled {
-			iter = wrapInUnsafeIter(iter)
-		}
-		return iter
-	}
-
 	iter := &p.normalIter
 	if opts.Prefix {
 		iter = &p.prefixIter
@@ -1988,11 +1999,9 @@ func (p *pebbleReadOnly) NewMVCCIterator(iterKind MVCCIterKind, opts IterOptions
 	if iter.inuse {
 		return newPebbleIterator(p.parent.db, p.iter, opts, p.durability)
 	}
-	// Ensures no timestamp hints etc.
-	checkOptionsForIterReuse(opts)
 
 	if iter.iter != nil {
-		iter.setBounds(opts.LowerBound, opts.UpperBound)
+		iter.setOptions(opts, p.durability)
 	} else {
 		iter.init(p.parent.db, p.iter, p.iterUnused, opts, p.durability)
 		if p.iter == nil {
@@ -2024,11 +2033,9 @@ func (p *pebbleReadOnly) NewEngineIterator(opts IterOptions) EngineIterator {
 	if iter.inuse {
 		return newPebbleIterator(p.parent.db, p.iter, opts, p.durability)
 	}
-	// Ensures no timestamp hints etc.
-	checkOptionsForIterReuse(opts)
 
 	if iter.iter != nil {
-		iter.setBounds(opts.LowerBound, opts.UpperBound)
+		iter.setOptions(opts, p.durability)
 	} else {
 		iter.init(p.parent.db, p.iter, p.iterUnused, opts, p.durability)
 		if p.iter == nil {
@@ -2041,18 +2048,6 @@ func (p *pebbleReadOnly) NewEngineIterator(opts IterOptions) EngineIterator {
 
 	iter.inuse = true
 	return iter
-}
-
-// checkOptionsForIterReuse checks that the options are appropriate for
-// iterators that are reusable, and panics if not. This includes disallowing
-// any timestamp hints.
-func checkOptionsForIterReuse(opts IterOptions) {
-	if !opts.MinTimestampHint.IsEmpty() || !opts.MaxTimestampHint.IsEmpty() {
-		panic("iterator with timestamp hints cannot be reused")
-	}
-	if !opts.Prefix && len(opts.UpperBound) == 0 && len(opts.LowerBound) == 0 {
-		panic("iterator must set prefix or upper bound or lower bound")
-	}
 }
 
 // ConsistentIterators implements the Engine interface.

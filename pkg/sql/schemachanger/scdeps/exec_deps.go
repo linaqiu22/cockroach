@@ -55,12 +55,15 @@ func NewExecutorDependencies(
 	descsCollection *descs.Collection,
 	jobRegistry JobRegistry,
 	backfiller scexec.Backfiller,
-	backfillTracker scexec.BackfillTracker,
+	merger scexec.Merger,
+	backfillTracker scexec.BackfillerTracker,
 	backfillFlusher scexec.PeriodicProgressFlusher,
 	indexValidator scexec.IndexValidator,
 	clock scmutationexec.Clock,
 	commentUpdaterFactory scexec.DescriptorMetadataUpdaterFactory,
 	eventLogger scexec.EventLogger,
+	statsRefresher scexec.StatsRefresher,
+	testingKnobs *scexec.TestingKnobs,
 	kvTrace bool,
 	schemaChangerJobID jobspb.JobID,
 	statements []string,
@@ -73,31 +76,36 @@ func NewExecutorDependencies(
 			jobRegistry:        jobRegistry,
 			indexValidator:     indexValidator,
 			eventLogger:        eventLogger,
+			statsRefresher:     statsRefresher,
 			schemaChangerJobID: schemaChangerJobID,
 			kvTrace:            kvTrace,
 		},
 		backfiller:              backfiller,
-		backfillTracker:         backfillTracker,
+		merger:                  merger,
+		backfillerTracker:       backfillTracker,
 		commentUpdaterFactory:   commentUpdaterFactory,
 		periodicProgressFlusher: backfillFlusher,
 		statements:              statements,
 		user:                    user,
 		sessionData:             sessionData,
 		clock:                   clock,
+		testingKnobs:            testingKnobs,
 	}
 }
 
 type txnDeps struct {
-	txn                *kv.Txn
-	codec              keys.SQLCodec
-	descsCollection    *descs.Collection
-	jobRegistry        JobRegistry
-	createdJobs        []jobspb.JobID
-	indexValidator     scexec.IndexValidator
-	eventLogger        scexec.EventLogger
-	deletedDescriptors catalog.DescriptorIDSet
-	schemaChangerJobID jobspb.JobID
-	kvTrace            bool
+	txn                 *kv.Txn
+	codec               keys.SQLCodec
+	descsCollection     *descs.Collection
+	jobRegistry         JobRegistry
+	createdJobs         []jobspb.JobID
+	indexValidator      scexec.IndexValidator
+	statsRefresher      scexec.StatsRefresher
+	tableStatsToRefresh []descpb.ID
+	eventLogger         scexec.EventLogger
+	deletedDescriptors  catalog.DescriptorIDSet
+	schemaChangerJobID  jobspb.JobID
+	kvTrace             bool
 }
 
 func (d *txnDeps) UpdateSchemaChangeJob(
@@ -326,7 +334,7 @@ func (d *txnDeps) MaybeSplitIndexSpans(
 	return d.txn.DB().AdminSplit(ctx, span.Key, expirationTime)
 }
 
-// GetResumeSpans implements the scexec.BackfillTracker interface.
+// GetResumeSpans implements the scexec.BackfillerTracker interface.
 func (d *txnDeps) GetResumeSpans(
 	ctx context.Context, tableID descpb.ID, indexID descpb.IndexID,
 ) ([]roachpb.Span, error) {
@@ -342,7 +350,7 @@ func (d *txnDeps) GetResumeSpans(
 	return []roachpb.Span{table.IndexSpan(d.codec, indexID)}, nil
 }
 
-// SetResumeSpans implements the scexec.BackfillTracker interface.
+// SetResumeSpans implements the scexec.BackfillerTracker interface.
 func (d *txnDeps) SetResumeSpans(
 	ctx context.Context, tableID descpb.ID, indexID descpb.IndexID, total, done []roachpb.Span,
 ) error {
@@ -354,11 +362,13 @@ type execDeps struct {
 	clock                   scmutationexec.Clock
 	commentUpdaterFactory   scexec.DescriptorMetadataUpdaterFactory
 	backfiller              scexec.Backfiller
-	backfillTracker         scexec.BackfillTracker
+	merger                  scexec.Merger
+	backfillerTracker       scexec.BackfillerTracker
 	periodicProgressFlusher scexec.PeriodicProgressFlusher
 	statements              []string
 	user                    username.SQLUsername
 	sessionData             *sessiondata.SessionData
+	testingKnobs            *scexec.TestingKnobs
 }
 
 func (d *execDeps) Clock() scmutationexec.Clock {
@@ -377,9 +387,14 @@ func (d *execDeps) IndexBackfiller() scexec.Backfiller {
 	return d.backfiller
 }
 
+// IndexMerger implements the scexec.Dependencies interface.
+func (d *execDeps) IndexMerger() scexec.Merger {
+	return d.merger
+}
+
 // BackfillProgressTracker implements the scexec.Dependencies interface.
-func (d *execDeps) BackfillProgressTracker() scexec.BackfillTracker {
-	return d.backfillTracker
+func (d *execDeps) BackfillProgressTracker() scexec.BackfillerTracker {
+	return d.backfillerTracker
 }
 
 // PeriodicProgressFlusher implements the scexec.Dependencies interface.
@@ -424,11 +439,32 @@ func (d *execDeps) EventLogger() scexec.EventLogger {
 	return d.eventLogger
 }
 
-// NewNoOpBackfillTracker constructs a backfill tracker which does not do
-// anything. It will always return progress for a given backfill which
+// GetTestingKnobs implements scexec.Dependencies
+func (d *execDeps) GetTestingKnobs() *scexec.TestingKnobs {
+	return d.testingKnobs
+}
+
+// AddTableForStatsRefresh adds a table for stats refresh once we are finished
+// executing the current transaction.
+func (d *execDeps) AddTableForStatsRefresh(id descpb.ID) {
+	d.tableStatsToRefresh = append(d.tableStatsToRefresh, id)
+}
+
+// getTablesForStatsRefresh gets tables that need refresh for stats.
+func (d *execDeps) getTablesForStatsRefresh() []descpb.ID {
+	return d.tableStatsToRefresh
+}
+
+// StatsRefreshQueue implements scexec.Dependencies
+func (d *execDeps) StatsRefresher() scexec.StatsRefreshQueue {
+	return d
+}
+
+// NewNoOpBackfillerTracker constructs a backfiller tracker which does not do
+// anything. It will always return backfillProgress for a given backfill which
 // contains a full set of CompletedSpans corresponding to the source index
-// span and an empty MinimumWriteTimestamp.
-func NewNoOpBackfillTracker(codec keys.SQLCodec) scexec.BackfillTracker {
+// span and an empty MinimumWriteTimestamp. Similarly for merges.
+func NewNoOpBackfillerTracker(codec keys.SQLCodec) scexec.BackfillerTracker {
 	return noopBackfillProgress{codec: codec}
 }
 
@@ -456,8 +492,28 @@ func (n noopBackfillProgress) GetBackfillProgress(
 	}, nil
 }
 
+func (n noopBackfillProgress) GetMergeProgress(
+	ctx context.Context, m scexec.Merge,
+) (scexec.MergeProgress, error) {
+	p := scexec.MergeProgress{
+		Merge:          m,
+		CompletedSpans: make([][]roachpb.Span, len(m.SourceIndexIDs)),
+	}
+	for i, sourceID := range m.SourceIndexIDs {
+		prefix := n.codec.IndexPrefix(uint32(m.TableID), uint32(sourceID))
+		p.CompletedSpans[i] = []roachpb.Span{{Key: prefix, EndKey: prefix.PrefixEnd()}}
+	}
+	return p, nil
+}
+
 func (n noopBackfillProgress) SetBackfillProgress(
 	ctx context.Context, progress scexec.BackfillProgress,
+) error {
+	return nil
+}
+
+func (n noopBackfillProgress) SetMergeProgress(
+	ctx context.Context, progress scexec.MergeProgress,
 ) error {
 	return nil
 }
@@ -472,7 +528,7 @@ func NewNoopPeriodicProgressFlusher() scexec.PeriodicProgressFlusher {
 }
 
 func (n noopPeriodicProgressFlusher) StartPeriodicUpdates(
-	ctx context.Context, tracker scexec.BackfillProgressFlusher,
+	ctx context.Context, tracker scexec.BackfillerProgressFlusher,
 ) (stop func() error) {
 	return func() error { return nil }
 }

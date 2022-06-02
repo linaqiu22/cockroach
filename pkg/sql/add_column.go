@@ -124,7 +124,9 @@ func (p *planner) addColumnImpl(
 
 	n.tableDesc.AddColumnMutation(col, descpb.DescriptorMutation_ADD)
 	if idx != nil {
-		if err := n.tableDesc.AddIndexMutation(params.ctx, idx, descpb.DescriptorMutation_ADD, params.p.ExecCfg().Settings); err != nil {
+		if err := n.tableDesc.AddIndexMutationMaybeWithTempIndex(
+			params.ctx, idx, descpb.DescriptorMutation_ADD, params.p.ExecCfg().Settings,
+		); err != nil {
 			return err
 		}
 	}
@@ -164,9 +166,9 @@ func (p *planner) addColumnImpl(
 
 	// If the new column has a DEFAULT or an ON UPDATE expression that uses a
 	// sequence, add references between its descriptor and this column descriptor.
-	if err := cdd.ForEachTypedExpr(func(expr tree.TypedExpr) error {
+	if err := cdd.ForEachTypedExpr(func(expr tree.TypedExpr, colExprKind tabledesc.ColExprKind) error {
 		changedSeqDescs, err := maybeAddSequenceDependencies(
-			params.ctx, params.ExecCfg().Settings, params.p, n.tableDesc, col, expr, nil,
+			params.ctx, params.ExecCfg().Settings, params.p, n.tableDesc, col, expr, nil, colExprKind,
 		)
 		if err != nil {
 			return err
@@ -202,6 +204,17 @@ func (p *planner) addColumnImpl(
 			n.tableDesc,
 			*idx,
 		); err != nil {
+			return err
+		}
+	}
+
+	if col.Virtual && !col.Nullable {
+		colName := tree.Name(col.Name)
+		newCol, err := n.tableDesc.FindColumnWithName(colName)
+		if err != nil {
+			return errors.NewAssertionErrorWithWrappedErrf(err, "failed to find newly added column %v", colName)
+		}
+		if err := addNotNullConstraintMutationForCol(n.tableDesc, newCol); err != nil {
 			return err
 		}
 	}

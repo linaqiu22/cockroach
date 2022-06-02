@@ -67,9 +67,9 @@ func TestExternalDistinct(t *testing.T) {
 			var semsToCheck []semaphore.Semaphore
 			var outputOrdering execinfrapb.Ordering
 			verifier := colexectestutils.UnorderedVerifier
-			// Check that the external distinct and the disk-backed sort
-			// were added as Closers.
-			numExpectedClosers := 2
+			// Check that the disk spiller, the external distinct, and the
+			// disk-backed sort were added as Closers.
+			numExpectedClosers := 3
 			if tc.isOrderedOnDistinctCols {
 				outputOrdering = convertDistinctColsToOrdering(tc.distinctCols)
 				verifier = colexectestutils.OrderedVerifier
@@ -91,14 +91,8 @@ func TestExternalDistinct(t *testing.T) {
 				require.Equal(t, numExpectedClosers, len(closers))
 				return distinct, err
 			})
-			if tc.errorOnDup == "" || tc.noError {
-				// We don't check that all FDs were released if an error is
-				// expected to be returned because our utility closeIfCloser()
-				// doesn't handle multiple closers (which is always the case for
-				// the external distinct).
-				for i, sem := range semsToCheck {
-					require.Equal(t, 0, sem.GetCount(), "sem still reports open FDs at index %d", i)
-				}
+			for i, sem := range semsToCheck {
+				require.Equal(t, 0, sem.GetCount(), "sem still reports open FDs at index %d", i)
 			}
 		}
 	}
@@ -196,9 +190,9 @@ func TestExternalDistinctSpilling(t *testing.T) {
 				&monitorRegistry,
 			)
 			require.NoError(t, err)
-			// Check that the external distinct and the disk-backed sort
-			// were added as Closers.
-			numExpectedClosers := 2
+			// Check that the disk spiller, the external distinct, and the
+			// disk-backed sort were added as Closers.
+			numExpectedClosers := 3
 			require.Equal(t, numExpectedClosers, len(closers))
 			numRuns++
 			return distinct, nil

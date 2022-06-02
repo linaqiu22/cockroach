@@ -37,10 +37,10 @@ go_test(
     data = glob(["testdata/**"]),
     deps = [
         "//pkg/base",
-        "//pkg/security",
+        "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/server",
-        "//pkg/sql/schemachanger/scrun",
+        "//pkg/sql/schemachanger/scexec",
         "//pkg/sql/schemachanger/sctest",
         "//pkg/testutils",
         "//pkg/testutils/serverutils",

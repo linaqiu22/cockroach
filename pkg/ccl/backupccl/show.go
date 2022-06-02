@@ -14,6 +14,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backupencryption"
+	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backuppb"
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -328,8 +330,8 @@ func showBackupPlanHook(
 		showEncErr := `If you are running SHOW BACKUP exclusively on an incremental backup, 
 you must pass the 'encryption_info_dir' parameter that points to the directory of your full backup`
 		if passphrase, ok := opts[backupOptEncPassphrase]; ok {
-			opts, err := readEncryptionOptions(ctx, encStore)
-			if errors.Is(err, errEncryptionInfoRead) {
+			opts, err := backupencryption.ReadEncryptionOptions(ctx, encStore)
+			if errors.Is(err, backupencryption.ErrEncryptionInfoRead) {
 				return errors.WithHint(err, showEncErr)
 			}
 			if err != nil {
@@ -341,19 +343,22 @@ you must pass the 'encryption_info_dir' parameter that points to the directory o
 				Key:  encryptionKey,
 			}
 		} else if kms, ok := opts[backupOptEncKMS]; ok {
-			opts, err := readEncryptionOptions(ctx, encStore)
-			if errors.Is(err, errEncryptionInfoRead) {
+			opts, err := backupencryption.ReadEncryptionOptions(ctx, encStore)
+			if errors.Is(err, backupencryption.ErrEncryptionInfoRead) {
 				return errors.WithHint(err, showEncErr)
 			}
 			if err != nil {
 				return err
 			}
 
-			env := &backupKMSEnv{p.ExecCfg().Settings, &p.ExecCfg().ExternalIODirConfig}
+			env := &backupencryption.BackupKMSEnv{
+				Settings: p.ExecCfg().Settings,
+				Conf:     &p.ExecCfg().ExternalIODirConfig,
+			}
 			var defaultKMSInfo *jobspb.BackupEncryptionOptions_KMSInfo
 			for _, encFile := range opts {
-				defaultKMSInfo, err = validateKMSURIsAgainstFullBackup([]string{kms},
-					newEncryptedDataKeyMapFromProtoMap(encFile.EncryptedDataKeyByKMSMasterKeyID), env)
+				defaultKMSInfo, err = backupencryption.ValidateKMSURIsAgainstFullBackup(ctx, []string{kms},
+					backupencryption.NewEncryptedDataKeyMapFromProtoMap(encFile.EncryptedDataKeyByKMSMasterKeyID), env)
 				if err == nil {
 					break
 				}
@@ -562,7 +567,7 @@ func checkBackupFiles(
 type backupInfo struct {
 	collectionURI string
 	defaultURIs   []string
-	manifests     []BackupManifest
+	manifests     []backuppb.BackupManifest
 	subdir        string
 	localityInfo  []jobspb.RestoreDetails_BackupLocalityInfo
 	enc           *jobspb.BackupEncryptionOptions
@@ -651,7 +656,7 @@ func backupShowerDefault(
 					return nil, err
 				}
 				backupType := tree.NewDString("full")
-				if manifest.isIncremental() {
+				if manifest.IsIncremental() {
 					backupType = tree.NewDString("incremental")
 				}
 				start := tree.DNull
@@ -815,7 +820,7 @@ type descriptorSize struct {
 // getLogicalSSTSize gets the total logical bytes stored in each SST. Note that a
 // BackupManifest_File identifies a span in an SST and there can be multiple
 // spans stored in an SST.
-func getLogicalSSTSize(files []BackupManifest_File) map[string]int64 {
+func getLogicalSSTSize(files []backuppb.BackupManifest_File) map[string]int64 {
 	sstDataSize := make(map[string]int64)
 	for _, file := range files {
 		sstDataSize[file.Path] += file.EntryCounts.DataSize
@@ -832,7 +837,7 @@ func approximateTablePhysicalSize(
 
 // getTableSizes gathers row and size count for each table in the manifest
 func getTableSizes(
-	files []BackupManifest_File, fileSizes []int64,
+	files []backuppb.BackupManifest_File, fileSizes []int64,
 ) (map[descpb.ID]descriptorSize, error) {
 	tableSizes := make(map[descpb.ID]descriptorSize)
 	if len(files) == 0 {
@@ -984,7 +989,7 @@ func backupShowerFileSetup(inCol tree.StringOrPlaceholderOptList) backupShower {
 			}
 			for i, manifest := range info.manifests {
 				backupType := "full"
-				if manifest.isIncremental() {
+				if manifest.IsIncremental() {
 					backupType = "incremental"
 				}
 

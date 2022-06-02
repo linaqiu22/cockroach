@@ -100,6 +100,18 @@ func (s *TestState) IncrementSchemaChangeDropCounter(counterType string) {
 	s.LogSideEffectf("increment telemetry for sql.schema.drop_%s", counterType)
 }
 
+// IncrementSchemaChangeAddColumnTypeCounter  implements the scbuild.Dependencies
+// interface.
+func (s *TestState) IncrementSchemaChangeAddColumnTypeCounter(typeName string) {
+	s.LogSideEffectf("increment telemetry for sql.schema.new_column_type.%s", typeName)
+}
+
+// IncrementSchemaChangeAddColumnQualificationCounter  implements the scbuild.Dependencies
+// interface.
+func (s *TestState) IncrementSchemaChangeAddColumnQualificationCounter(qualification string) {
+	s.LogSideEffectf("increment telemetry for sql.schema.qualifcation.%s", qualification)
+}
+
 // IncrementUserDefinedSchemaCounter implements the scbuild.Dependencies
 // interface.
 func (s *TestState) IncrementUserDefinedSchemaCounter(
@@ -775,6 +787,11 @@ func (s *TestState) IndexBackfiller() scexec.Backfiller {
 	return s.backfiller
 }
 
+// IndexMerger implements the scexec.Dependencies interface.
+func (s *TestState) IndexMerger() scexec.Merger {
+	return s.merger
+}
+
 // PeriodicProgressFlusher implements the scexec.Dependencies interface.
 func (s *TestState) PeriodicProgressFlusher() scexec.PeriodicProgressFlusher {
 	return scdeps.NewNoopPeriodicProgressFlusher()
@@ -885,7 +902,7 @@ func (s *TestState) SchemaChangerJobID() jobspb.JobID {
 }
 
 // TestingKnobs exposes the testing knobs.
-func (s *TestState) TestingKnobs() *scrun.TestingKnobs {
+func (s *TestState) TestingKnobs() *scexec.TestingKnobs {
 	return s.testingKnobs
 }
 
@@ -951,6 +968,15 @@ func (s *TestState) LogEvent(
 ) error {
 	s.LogSideEffectf("write %T to event log for descriptor #%d: %s",
 		event, descID, details.Statement)
+	return nil
+}
+
+// LogEventForSchemaChange implements scexec.EventLogger
+func (s *TestState) LogEventForSchemaChange(
+	ctx context.Context, descID descpb.ID, event eventpb.EventPayload,
+) error {
+	s.LogSideEffectf("write %T to event log for descriptor %d",
+		event, descID)
 	return nil
 }
 
@@ -1031,4 +1057,31 @@ func (s *TestState) DescriptorMetadataUpdater(
 	ctx context.Context,
 ) scexec.DescriptorMetadataUpdater {
 	return s
+}
+
+// IsTableEmpty implement scbuild.TableReader.
+func (s *TestState) IsTableEmpty(
+	ctx context.Context, id descpb.ID, primaryIndexID descpb.IndexID,
+) bool {
+	return true
+}
+
+// TableReader implement scexec.Dependencies.
+func (s *TestState) TableReader() scbuild.TableReader {
+	return s
+}
+
+// StatsRefresher implement scexec.Dependencies.
+func (s *TestState) StatsRefresher() scexec.StatsRefreshQueue {
+	return s
+}
+
+// GetTestingKnobs implement scexec.Dependencies.
+func (s *TestState) GetTestingKnobs() *scexec.TestingKnobs {
+	return &scexec.TestingKnobs{}
+}
+
+// AddTableForStatsRefresh implements scexec.StatsRefreshQueue
+func (s *TestState) AddTableForStatsRefresh(id descpb.ID) {
+	s.LogSideEffectf("adding table for stats refresh: %d", id)
 }

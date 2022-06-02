@@ -102,17 +102,6 @@ ORDER BY name ASC`)
 		assert.NoError(t, rows.Scan(&table))
 		tables = append(tables, table)
 	}
-	tables = append(
-		tables,
-		"system.jobs",
-		"system.descriptor",
-		"system.namespace",
-		"system.scheduled_jobs",
-		"system.replication_constraint_stats",
-		"system.replication_critical_localities",
-		"system.replication_stats",
-		"system.settings",
-	)
 	sort.Strings(tables)
 
 	var exp []string
@@ -347,6 +336,8 @@ func eraseNonDeterministicZipOutput(out string) string {
 	out = re.ReplaceAllString(out, `dial tcp ...`)
 	re = regexp.MustCompile(`(?m)rpc error: .*$`)
 	out = re.ReplaceAllString(out, `rpc error: ...`)
+	re = regexp.MustCompile(`(?m)failed to connect to .*$`)
+	out = re.ReplaceAllString(out, `failed to connect to ...`)
 
 	// The number of memory profiles previously collected is not deterministic.
 	re = regexp.MustCompile(`(?m)^\[node \d+\] \d+ heap profiles found$`)

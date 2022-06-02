@@ -70,12 +70,15 @@ func (ti testInfra) newExecDeps(
 		descsCollection,
 		noopJobRegistry{},
 		noopBackfiller{},
-		scdeps.NewNoOpBackfillTracker(ti.lm.Codec()),
+		noopMerger{},
+		scdeps.NewNoOpBackfillerTracker(ti.lm.Codec()),
 		scdeps.NewNoopPeriodicProgressFlusher(),
 		noopIndexValidator{},
 		scdeps.NewConstantClock(timeutil.Now()),
 		noopMetadataUpdaterFactory{},
 		noopEventLogger{},
+		noopStatsReferesher{},
+		&scexec.TestingKnobs{},
 		kvTrace,
 		schemaChangerJobID,
 		nil, /* statements */
@@ -183,7 +186,8 @@ CREATE TABLE db.t (
 		KeyColumnDirections: []descpb.IndexDescriptor_Direction{
 			descpb.IndexDescriptor_ASC,
 		},
-		ConstraintID: 3,
+		ConstraintID:                3,
+		UseDeletePreservingEncoding: true,
 	}
 	for _, tc := range []testCase{
 		{
@@ -205,7 +209,7 @@ CREATE TABLE db.t (
 			}),
 			ops: func() []scop.Op {
 				return []scop.Op{
-					&scop.MakeAddedIndexDeleteOnly{
+					&scop.MakeAddedTempIndexDeleteOnly{
 						Index: scpb.Index{
 							TableID:             table.ID,
 							IndexID:             indexToAdd.ID,
@@ -475,16 +479,31 @@ func (n noopBackfiller) MaybePrepareDestIndexesForBackfill(
 	return progress, nil
 }
 
-func (n noopBackfiller) BackfillIndex(
+func (n noopBackfiller) BackfillIndexes(
 	ctx context.Context,
 	progress scexec.BackfillProgress,
-	writer scexec.BackfillProgressWriter,
+	writer scexec.BackfillerProgressWriter,
+	descriptor catalog.TableDescriptor,
+) error {
+	return nil
+}
+
+type noopMerger struct{}
+
+var _ scexec.Merger = (*noopMerger)(nil)
+
+func (n noopMerger) MergeIndexes(
+	ctx context.Context,
+	progress scexec.MergeProgress,
+	writer scexec.BackfillerProgressWriter,
 	descriptor catalog.TableDescriptor,
 ) error {
 	return nil
 }
 
 type noopIndexValidator struct{}
+
+var _ scexec.IndexValidator = noopIndexValidator{}
 
 func (noopIndexValidator) ValidateForwardIndexes(
 	ctx context.Context,
@@ -506,17 +525,32 @@ func (noopIndexValidator) ValidateInvertedIndexes(
 
 type noopEventLogger struct{}
 
+var _ scexec.EventLogger = noopEventLogger{}
+
 func (noopEventLogger) LogEvent(
 	_ context.Context, _ descpb.ID, _ eventpb.CommonSQLEventDetails, _ eventpb.EventPayload,
 ) error {
 	return nil
 }
 
-type noopMetadataUpdaterFactory struct {
+func (noopEventLogger) LogEventForSchemaChange(
+	_ context.Context, _ descpb.ID, _ eventpb.EventPayload,
+) error {
+	return nil
 }
 
-type noopMetadataUpdater struct {
+type noopStatsReferesher struct{}
+
+func (noopStatsReferesher) NotifyMutation(table catalog.TableDescriptor, rowsAffected int) {
 }
+
+type noopMetadataUpdaterFactory struct{}
+
+var _ scexec.DescriptorMetadataUpdaterFactory = noopMetadataUpdaterFactory{}
+
+type noopMetadataUpdater struct{}
+
+var _ scexec.DescriptorMetadataUpdater = noopMetadataUpdater{}
 
 // NewMetadataUpdater implements scexec.DescriptorMetadataUpdaterFactory.
 func (noopMetadataUpdaterFactory) NewMetadataUpdater(
@@ -578,4 +612,5 @@ func (noopMetadataUpdater) DeleteSchedule(ctx context.Context, scheduleID int64)
 var _ scexec.Backfiller = noopBackfiller{}
 var _ scexec.IndexValidator = noopIndexValidator{}
 var _ scexec.EventLogger = noopEventLogger{}
+var _ scexec.StatsRefresher = noopStatsReferesher{}
 var _ scexec.DescriptorMetadataUpdater = noopMetadataUpdater{}

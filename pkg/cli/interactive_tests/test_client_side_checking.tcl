@@ -28,7 +28,7 @@ end_test
 start_test "Check that the syntax checker does not get confused by empty inputs."
 # (issue #22441.)
 send ";\r"
-eexpect "0 rows"
+eexpect "OK"
 eexpect root@
 end_test
 
@@ -80,6 +80,13 @@ end_test
 start_test "Check that --debug-sql-cli sets suitable simplified client-side options."
 send "$argv sql --debug-sql-cli\r"
 eexpect "Welcome"
+
+# Check empty db name for build info query.
+eexpect "\"\".crdb_internal.node_build_info"
+# Check invitation to reset db name.
+eexpect "you might want to set the current database"
+eexpect "to the empty string"
+
 eexpect "root@"
 send "\\set display_format csv\r\\set\r"
 eexpect "check_syntax,false"

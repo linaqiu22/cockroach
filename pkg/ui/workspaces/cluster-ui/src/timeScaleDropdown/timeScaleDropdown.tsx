@@ -12,14 +12,16 @@ import React, { useMemo } from "react";
 import moment from "moment";
 import classNames from "classnames/bind";
 import {
-  TimeRangeTitle,
   TimeScale,
   TimeWindow,
   ArrowDirection,
   TimeScaleOptions,
 } from "./timeScaleTypes";
 import TimeFrameControls from "./timeFrameControls";
-import RangeSelect, { RangeOption } from "./rangeSelect";
+import RangeSelect, {
+  RangeOption,
+  Selected as RangeSelectSelected,
+} from "./rangeSelect";
 import { defaultTimeScaleOptions, findClosestTimeScale } from "./utils";
 
 import styles from "./timeScale.module.scss";
@@ -27,7 +29,7 @@ import styles from "./timeScale.module.scss";
 const cx = classNames.bind(styles);
 
 export const dateFormat = "MMM DD,";
-export const timeFormat = "h:mmA";
+export const timeFormat = "H:mm";
 
 export interface TimeScaleDropdownProps {
   currentScale: TimeScale;
@@ -37,6 +39,7 @@ export interface TimeScaleDropdownProps {
     curTimeScale: TimeScale,
     timeWindow: TimeWindow,
   ) => TimeScale;
+  hasCustomOption?: boolean;
 }
 
 export const getTimeLabel = (
@@ -67,10 +70,16 @@ export const getTimeLabel = (
   }
 };
 
-export const getTimeRangeTitle = (
+export const formatRangeSelectSelected = (
   currentWindow: TimeWindow,
   currentScale: TimeScale,
-): TimeRangeTitle => {
+): RangeSelectSelected => {
+  const selected = {
+    timeLabel: getTimeLabel(currentWindow),
+    timeWindow: currentWindow,
+    key: currentScale.key,
+  };
+
   if (currentScale.key === "Custom") {
     const start = currentWindow.start.utc();
     const end = currentWindow.end.utc();
@@ -79,20 +88,14 @@ export const getTimeRangeTitle = (
 
     const omitDayFormat = endDayIsToday && startEndOnSameDay;
     return {
+      ...selected,
       dateStart: omitDayFormat ? "" : start.format(dateFormat),
       dateEnd: omitDayFormat || startEndOnSameDay ? "" : end.format(dateFormat),
       timeStart: moment.utc(start).format(timeFormat),
       timeEnd: moment.utc(end).format(timeFormat),
-      title: "Custom",
-      timeLabel: getTimeLabel(currentWindow),
-      timeWindow: currentWindow,
     };
   } else {
-    return {
-      title: currentScale.key,
-      timeLabel: getTimeLabel(currentWindow),
-      timeWindow: currentWindow,
-    };
+    return selected;
   }
 };
 
@@ -125,6 +128,7 @@ export const TimeScaleDropdown: React.FC<TimeScaleDropdownProps> = ({
   options = defaultTimeScaleOptions,
   setTimeScale,
   adjustTimeScaleOnChange,
+  hasCustomOption = true,
 }): React.ReactElement => {
   const end = currentScale.fixedWindowEnd
     ? moment.utc(currentScale.fixedWindowEnd)
@@ -134,7 +138,7 @@ export const TimeScaleDropdown: React.FC<TimeScaleDropdownProps> = ({
     end,
   };
 
-  const onOptionSelect = (rangeOption: RangeOption) => {
+  const onPresetOptionSelect = (rangeOption: RangeOption) => {
     let timeScale: TimeScale = {
       ...options[rangeOption.label],
       key: rangeOption.label,
@@ -220,13 +224,15 @@ export const TimeScaleDropdown: React.FC<TimeScaleDropdownProps> = ({
       label: key,
       timeLabel: getTimeLabel(null, value.windowSize),
     }));
-    optionsList.push({
-      value: "Custom",
-      label: "Custom",
-      timeLabel: "--",
-    });
+    if (hasCustomOption) {
+      optionsList.push({
+        value: "Custom",
+        label: "Custom",
+        timeLabel: "--",
+      });
+    }
     return optionsList;
-  }, [options]);
+  }, [options, hasCustomOption]);
 
   const setDateRange = ([start, end]: [moment.Moment, moment.Moment]) => {
     const seconds = moment.duration(moment.utc(end).diff(start)).asSeconds();
@@ -245,9 +251,9 @@ export const TimeScaleDropdown: React.FC<TimeScaleDropdownProps> = ({
   return (
     <div className={cx("timescale")}>
       <RangeSelect
-        selected={getTimeRangeTitle(currentWindow, currentScale)}
-        onChange={onOptionSelect}
-        changeDate={setDateRange}
+        selected={formatRangeSelectSelected(currentWindow, currentScale)}
+        onPresetOptionSelect={onPresetOptionSelect}
+        onCustomSelect={setDateRange}
         options={timeScaleOptions}
       />
       <TimeFrameControls
